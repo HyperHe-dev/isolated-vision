@@ -14,6 +14,41 @@
 > 数据处理保证，也不是 OpenAI 官方产品。处理敏感材料前请阅读
 > [SECURITY.md](SECURITY.md)。
 
+## 为什么有这个项目
+
+这是针对一组 Codex 上游历史与上下文问题的临时客户端缓解方案：
+
+- [openai/codex#28316](https://github.com/openai/codex/issues/28316) 跟踪大型
+  base64 图片工具输出被保留、并在后续上下文中重复发送的问题。
+- [openai/codex#24550](https://github.com/openai/codex/issues/24550) 复现了压缩
+  后的 `replacement_history` 保留内联图片，进而导致 WebSocket 重试与 HTTP
+  回退的问题。
+- [openai/codex#24388](https://github.com/openai/codex/issues/24388) 记录了相关的
+  compaction 死锁变体；
+  [openai/codex#33024](https://github.com/openai/codex/issues/33024) 则跟踪大上下文
+  任务在响应边界长时间停顿这一更宽泛的现象。
+
+这些报告的具体触发条件并不完全相同：图片可能累积在实时工具输出历史中，也可能
+在压缩后继续留在历史里。它们共同属于下面这类故障链：
+
+```text
+父任务 view_image
+  -> 内联图片进入可重放的父任务历史
+  -> 实时或压缩后的历史持续增大
+  -> 后续重建、压缩或传输再次处理这些字节
+  -> 延迟、重试、回退和失败风险叠加
+```
+
+本 Skill 只能让那些在像素进入父任务*之前*就被正确路由的本地图片绕开这条路径。
+它不是上游修复，不能修复已经膨胀的任务，也不是大上下文延迟的通用解决方案。
+
+在一次[脱敏的本机复现](https://github.com/openai/codex/issues/24550#issuecomment-5463336508)
+中，compaction 刚完成后，工具结果到下一次模型动作之间约需 5–9 秒；当 25 张图片
+重新累积出约 85 MiB 的活动图片历史后，同类等待增长到 5 分 25 秒至 6 分 09 秒。
+另一个约八小时的统计窗口记录了约 6.95 GB Codex 上行流量。这些数字说明了临时
+方案存在的动机，不是可迁移的性能 benchmark，也不能证明仅凭图片大小就必然触发
+传输失败。
+
 ## 工作方式
 
 1. 父任务根据当前任务和已启用的领域 Skill 生成视觉审查简报。

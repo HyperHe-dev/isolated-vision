@@ -14,6 +14,45 @@ streams out of the parent task's rollout when the parent would otherwise call
 > processing guarantee, or an OpenAI product. Read [SECURITY.md](SECURITY.md)
 > before using it with sensitive material.
 
+## Why this exists
+
+This project is a temporary client-side mitigation for a family of upstream
+Codex history and context issues:
+
+- [openai/codex#28316](https://github.com/openai/codex/issues/28316) tracks
+  large base64 image tool outputs being retained and resent in later context.
+- [openai/codex#24550](https://github.com/openai/codex/issues/24550) reproduces
+  inline images in compacted `replacement_history` causing WebSocket retries
+  and HTTP fallback.
+- [openai/codex#24388](https://github.com/openai/codex/issues/24388) documents a
+  related compaction-deadlock variant, while
+  [openai/codex#33024](https://github.com/openai/codex/issues/33024) tracks the
+  broader symptom of long response-boundary stalls in large-context tasks.
+
+The exact trigger is not identical in every report. Images may accumulate in
+live tool-output history or survive inside compacted history. The common failure
+family is:
+
+```text
+parent view_image
+  -> inline image enters reusable parent history
+  -> live or compacted history grows
+  -> later rebuild, compaction, or transport handles those bytes again
+  -> latency, retries, fallback, and failure risk can compound
+```
+
+This Skill avoids that path only for local images routed through it *before*
+their pixels reach the parent. It is not an upstream fix, a repair tool for an
+already bloated task, or a general solution to large-context latency.
+
+In one [redacted local reproduction](https://github.com/openai/codex/issues/24550#issuecomment-5463336508),
+post-tool continuation took 5-9 seconds immediately after compaction, then
+5:25-6:09 after 25 images had rebuilt roughly 85 MiB of active image history.
+An approximately eight-hour window recorded about 6.95 GB of Codex upstream
+traffic. These measurements explain the motivation for the workaround; they are
+not a portable benchmark or proof that image size alone triggers transport
+failure.
+
 ## How it works
 
 1. The parent task derives a visual brief from its active task and domain Skill.
