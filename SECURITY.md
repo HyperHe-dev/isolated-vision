@@ -10,11 +10,14 @@ image-bearing tool call:
 
 - the child receives the image through `codex exec --image`;
 - the child session is launched with `--ephemeral`;
-- child stdout and stderr are discarded;
+- child JSONL stdout is consumed privately, only fixed event categories and
+  aggregate timings are retained, and raw event payloads plus stderr are discarded;
 - only a schema-validated JSON report is returned;
 - Data URLs, base64-like payloads, image signatures, image-bearing keys, Markdown
   images, and HTML image tags are rejected;
 - incomplete attachment coverage and malformed reports fail closed.
+- a report found after timeout is returned only if the ordinary safety, schema,
+  and attachment-coverage validation still succeeds.
 
 ## Outside the boundary
 

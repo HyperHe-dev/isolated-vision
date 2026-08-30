@@ -19,10 +19,10 @@ Use this mode unless the current prompt contains `[image-rollout-shim-worker:v1]
 - Do not call `view_image`, emit an `image(...)` item, read image bytes, convert an image to a data URL, or use a screenshot tool that returns pixels to the parent.
 - When a CUA or browser helper can return text plus a screenshot, expose only text and path metadata to the parent. Do not call `nodeRepl.emitImage`, forward an image content block, or otherwise surface the screenshot pixels. If visual evidence is required, obtain a stable absolute local screenshot path without emitting it, then pass that path to this skill. If the tool cannot provide a path-only route, treat the visual inspection as blocked.
 - Decide whether `standard` or `thorough` inspection is appropriate. Prefer `thorough` for visual QA, dense interfaces, small text, or high-resolution sources.
-- Invoke `scripts/run_isolated_vision.py` once, passing each image with a separate `--image` argument and a JSON request on stdin. Resolve the script relative to this `SKILL.md`; run the executable directly or use `python3`, and do not assume a `python` alias exists. Do not copy its implementation into the parent context.
+- Invoke `scripts/run_isolated_vision.py`, passing each image with a separate `--image` argument and a JSON request on stdin. Treat the eight-source limit as a protocol ceiling, not a target batch size. Use the smallest semantically complete comparison group; when images do not need direct cross-image comparison, prefer separate sequential groups over one unnecessarily broad request. Resolve the script relative to this `SKILL.md`; run the executable directly or use `python3`, and do not assume a `python` alias exists. Do not copy its implementation into the parent context.
 - The launcher requires permission to create a private temporary workspace and to start a network-capable nested `codex exec`. If the parent execution sandbox prevents either operation, report the launcher's safe error and do not relax the sandbox or fall back to parent-side image inspection.
 - Model selection is optional. If the user chooses a model, pass that single identifier with `--model`; otherwise omit the option. A missing, empty, or whitespace-only value uses `gpt-5.6-sol`. Never compose additional CLI syntax into the value.
-- Consume only the launcher's JSON stdout. The launcher discards the child process streams and rejects unsafe final output.
+- Consume only the launcher's JSON stdout. The launcher privately consumes the child's machine-readable event stream, retains only fixed event categories and non-image timings, discards all raw event content and stderr, and rejects unsafe final output.
 - If the launcher returns an error, report it as a blocked visual inspection. Never fall back to opening the image in the parent.
 
 Request JSON:
@@ -39,7 +39,7 @@ Request JSON:
 }
 ```
 
-The successful stdout object contains `status: "ok"`, a validated `report`, and non-image execution metadata including `effective_model`. Treat observations as evidence and respect the report's confidence and limitations.
+The successful stdout object contains `status: "ok"`, a validated `report`, and non-image execution metadata including `effective_model` and safe diagnostics. An error object also contains safe diagnostics for the phase reached. If the worker times out after already writing a complete final report, the launcher accepts it only after the same output-safety, schema, and coverage validation used for an ordinary success. Treat observations as evidence and respect the report's confidence and limitations.
 
 ## Worker mode
 

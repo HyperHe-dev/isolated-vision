@@ -2,157 +2,88 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Experimental Codex Skill that routes local-image inspection through an ephemeral
-`codex exec` worker and returns a validated text-only report to the parent task.
-
-The narrow goal is to keep image content, Data URLs, base64, and raw worker
-streams out of the parent task's rollout when the parent would otherwise call
-`view_image` on an absolute local path.
+An experimental Codex Skill that sends local-image inspection to an ephemeral
+`codex exec` worker and returns only a validated text report to the parent task.
+Its purpose is to keep image bytes, Data URLs, base64, and raw worker output out
+of the parent's rollout.
 
 > [!IMPORTANT]
-> This is a behavioral rollout-isolation workaround, not an OS sandbox, a data
-> processing guarantee, or an OpenAI product. Read [SECURITY.md](SECURITY.md)
-> before using it with sensitive material.
+> This is a temporary, model-routed workaround—not an OS sandbox, a data-handling
+> guarantee, or an OpenAI product. See [SECURITY.md](SECURITY.md) before using it
+> with sensitive material.
 
-## Why this exists
+## Why
 
-This project is a temporary client-side mitigation for a family of upstream
-Codex history and context issues:
+This project mitigates a family of upstream Codex history/context issues in which
+inline image data can be retained and handled again during later turns,
+compaction, or transport:
+[openai/codex#28316](https://github.com/openai/codex/issues/28316),
+[openai/codex#24550](https://github.com/openai/codex/issues/24550),
+[openai/codex#24388](https://github.com/openai/codex/issues/24388), and
+[openai/codex#33024](https://github.com/openai/codex/issues/33024).
 
-- [openai/codex#28316](https://github.com/openai/codex/issues/28316) tracks
-  large base64 image tool outputs being retained and resent in later context.
-- [openai/codex#24550](https://github.com/openai/codex/issues/24550) reproduces
-  inline images in compacted `replacement_history` causing WebSocket retries
-  and HTTP fallback.
-- [openai/codex#24388](https://github.com/openai/codex/issues/24388) documents a
-  related compaction-deadlock variant, while
-  [openai/codex#33024](https://github.com/openai/codex/issues/33024) tracks the
-  broader symptom of long response-boundary stalls in large-context tasks.
+It only protects local images routed through the Skill *before* their pixels
+reach the parent. It cannot clean an already bloated task or fix the upstream
+behavior.
 
-The exact trigger is not identical in every report. Images may accumulate in
-live tool-output history or survive inside compacted history. The common failure
-family is:
-
-```text
-parent view_image
-  -> inline image enters reusable parent history
-  -> live or compacted history grows
-  -> later rebuild, compaction, or transport handles those bytes again
-  -> latency, retries, fallback, and failure risk can compound
-```
-
-This Skill avoids that path only for local images routed through it *before*
-their pixels reach the parent. It is not an upstream fix, a repair tool for an
-already bloated task, or a general solution to large-context latency.
-
-In one [redacted local reproduction](https://github.com/openai/codex/issues/24550#issuecomment-5463336508),
-post-tool continuation took 5-9 seconds immediately after compaction, then
-5:25-6:09 after 25 images had rebuilt roughly 85 MiB of active image history.
-An approximately eight-hour window recorded about 6.95 GB of Codex upstream
-traffic. These measurements explain the motivation for the workaround; they are
-not a portable benchmark or proof that image size alone triggers transport
-failure.
+Local tests observed about 14 seconds for a simple worker call, about 31 seconds
+for an implicit parent-to-worker flow, and 69–84 seconds for thorough three-image
+reviews. A 90-image historical replay preserved the main visual findings while
+correcting several overconfident claims. These are indicative results, not
+portable benchmarks.
 
 ## How it works
 
-1. The parent task derives a visual brief from its active task and domain Skill.
-2. The launcher validates the brief and local image paths.
-3. In `thorough` mode it privately creates an overview plus overlapping
-   native-resolution tiles when needed.
-4. An authenticated, ephemeral `codex exec --image` worker reviews those images.
-5. The launcher discards the worker's stdout and stderr, validates its final JSON,
-   rejects image-like output, and returns only the text report and safe metadata.
+1. The parent derives a visual brief from the current task.
+2. The launcher validates the brief and local paths, preparing overview images
+   and native-resolution tiles when needed.
+3. An authenticated, ephemeral `codex exec --image` worker performs the review.
+4. The launcher discards raw worker streams and returns only a schema-validated,
+   image-free report and safe diagnostics.
 
-The parent remains responsible for deciding what to inspect and how to apply the
-report. The worker only supplies visual evidence.
-
-## Tested behavior and good-fit issues
-
-On the author's local setup, a simple direct visual run took about 14 seconds;
-the full implicit parent-to-worker flow took about 31 seconds. A private replay
-covered 90 historical image inputs in 13 batches and reproduced the major visual
-conclusions while also correcting several overconfident claims. In an end-to-end
-smoke test, the parent JSONL contained zero `input_image` blocks, Data URLs, or
-base64 markers. These are indicative observations, not portable benchmarks;
-latency varies with the model, network, image count, resolution, and review brief.
-
-The shim is a good fit for issues such as:
-
-- UI clipping, overlap, spacing, alignment, typography, contrast, and visual
-  regressions;
-- before/after screenshot comparisons and iterative render reviews;
-- rendered PDF, document, slide, or dashboard pages that already exist as local
-  image files;
-- high-resolution screenshots or small text that benefit from overview-plus-tile
-  inspection;
-- browser or Computer Use screenshots that can be saved to a local path without
-  emitting pixels to the parent.
-
-It is less suitable for latency-sensitive screenshot loops, exact pixel or
-colorimetry measurements, hidden application or 3D-scene state, and images that
-already entered the parent context. Concurrent nested runs were less reliable in
-testing, so prefer one batched invocation (up to eight source images) or sequential
-runs.
-
-## Requirements
-
-- macOS or Linux
-- Python 3.10 or newer
-- [Pillow](https://python-pillow.org/) for local image decoding and tiling
-- An authenticated `codex` CLI available on `PATH`
-- Permission to create a private temporary directory
-- A parent environment that permits the nested Codex process to reach the service
-
-The default worker model is `gpt-5.6-sol`. A caller may provide another single,
-validated model identifier.
+The parent decides what to inspect and how to use the evidence; the worker only
+performs the visual analysis.
 
 ## Install
 
-For a repository installation, ask Codex:
+Requirements: macOS or Linux, Python 3.10+, Pillow, and an authenticated `codex`
+CLI on `PATH`. The nested process must be allowed to reach the Codex service.
+
+Ask Codex to install the Skill directory from this repository:
 
 ```text
 Use $skill-installer to install the image-rollout-shim directory from this repository.
 ```
 
-Install the Python dependency into the same `python3` environment Codex will use:
+Then install its Python dependency into the same `python3` environment Codex uses:
 
 ```bash
 python3 -m pip install -r /absolute/path/to/checkout/image-rollout-shim/requirements.txt
 ```
 
-For a manual user-level installation, link or copy the Skill into the current
-Codex user Skill directory:
+Manual user-level installation also works:
 
 ```bash
 mkdir -p ~/.agents/skills
 ln -s /absolute/path/to/checkout/image-rollout-shim ~/.agents/skills/image-rollout-shim
 ```
 
-Codex normally detects Skill changes automatically. Restart it if the Skill does
-not appear.
-
 ## Use
-
-Explicit invocation:
 
 ```text
 Use $image-rollout-shim to visually audit /absolute/path/to/screenshot.png.
 Use thorough mode and focus on clipping, alignment, typography, and regressions.
 ```
 
-Model override:
+The default worker model is `gpt-5.6-sol`; a caller may request another model:
 
 ```text
 Use $image-rollout-shim with model gpt-5.6-terra to compare these local renders.
 ```
 
-Implicit invocation is enabled, so Codex may select the Skill whenever it would
-otherwise inspect a local image with `view_image`. Because implicit Skill routing
-is model behavior rather than a hard tool interceptor, explicitly invoke the Skill
-when the isolation requirement is important.
-
-For stronger repository-local guidance without installing a Hook, add this to the
-repository's `AGENTS.md`:
+Implicit invocation is enabled, but Skill routing is model behavior rather than
+a hard tool interceptor. When isolation matters, invoke it explicitly or add this
+repository-local rule to `AGENTS.md`:
 
 ```markdown
 For every would-be `view_image` call on an absolute local image path, use
@@ -160,40 +91,21 @@ For every would-be `view_image` call on an absolute local image path, use
 the shim cannot run, stop that visual inspection instead of falling back.
 ```
 
-## Direct launcher smoke test
+## Good fits and limits
 
-The Skill normally invokes the launcher itself. To test the launcher directly:
+Good fits include UI defects and regressions, before/after comparisons, rendered
+documents or dashboards, and high-resolution screenshots with small text.
 
-```bash
-python3 image-rollout-shim/scripts/run_isolated_vision.py \
-  --image /absolute/path/to/image.png <<'JSON'
-{
-  "objective": "Describe the visible layout and identify obvious defects.",
-  "context": "Local smoke test.",
-  "focus": ["layout", "legibility", "visual defects"],
-  "questions": ["Are any elements clipped or overlapping?"],
-  "mode": "thorough",
-  "output_language": "English"
-}
-JSON
-```
+It is less suitable for latency-sensitive screenshot loops, exact pixel or color
+measurement, hidden application or 3D state, or images already present in the
+parent context. Eight source images is a protocol ceiling, not a recommended batch
+size: use the smallest comparison group that is semantically complete and process
+independent groups sequentially.
 
-Successful stdout is one JSON object with `status: "ok"`, a structured `report`,
-and non-image metadata. Errors are safe, stable JSON objects and never include the
-raw child streams.
-
-## Boundaries
-
-This project does not:
-
-- remove pixels that already entered the parent through a user attachment,
-  `view_image`, Computer Use, a browser screenshot, or another image-bearing tool;
-- automatically intercept every image-producing tool call;
-- change OpenAI service-side processing or retention behavior;
-- isolate the worker under a separate OS identity;
-- guarantee that visual conclusions are correct or lossless.
-
-See the full [isolation contract](image-rollout-shim/references/contract.md).
+The Skill does not intercept every image-producing tool, change service-side data
+handling, isolate the worker under another OS identity, or guarantee correct or
+lossless conclusions. See the full
+[isolation contract](image-rollout-shim/references/contract.md).
 
 ## Development
 
@@ -203,9 +115,8 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 python3 -m py_compile image-rollout-shim/scripts/run_isolated_vision.py
 ```
 
-The unit suite uses a fake Codex executable; it does not upload fixtures or require
-authentication. Live visual smoke tests are intentionally not run in GitHub
-Actions.
+Unit tests use a fake Codex executable and do not upload fixtures. Live visual
+tests are intentionally excluded from GitHub Actions.
 
 ## License
 

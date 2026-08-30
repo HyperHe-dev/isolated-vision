@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -7,6 +9,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from PIL import Image
@@ -24,7 +27,7 @@ import sys
 from pathlib import Path
 
 args = sys.argv[1:]
-required = ["exec", "--ephemeral", "--skip-git-repo-check", "--output-schema", "--output-last-message"]
+required = ["exec", "--json", "--ephemeral", "--skip-git-repo-check", "--output-schema", "--output-last-message"]
 if any(item not in args for item in required):
     raise SystemExit(91)
 if args[args.index("--sandbox") + 1] != "read-only":
@@ -43,6 +46,9 @@ prompt = sys.stdin.read()
 if "[image-rollout-shim-worker:v1]" not in prompt:
     raise SystemExit(93)
 
+print(json.dumps({"type": "thread.started", "thread_id": "private-worker"}), flush=True)
+print(json.dumps({"type": "turn.started"}), flush=True)
+
 request_line = next(line for line in prompt.splitlines() if line.startswith("REQUEST_JSON="))
 manifest_line = next(line for line in prompt.splitlines() if line.startswith("ATTACHMENT_MANIFEST_JSON="))
 request = json.loads(request_line.split("=", 1)[1])
@@ -51,6 +57,7 @@ source_count = len({item["source_image"] for item in manifest})
 
 unsafe = os.environ.get("FAKE_CODEX_UNSAFE") == "1"
 if os.environ.get("FAKE_CODEX_FAIL") == "1":
+    print(json.dumps({"type": "error", "message": "private failure detail"}), flush=True)
     print("data:image/png;base64,FAILURE-STDOUT-MUST-NOT-ESCAPE")
     print("iVBORw0KGgoFAILURE-STDERR-MUST-NOT-ESCAPE", file=sys.stderr)
     raise SystemExit(37)
@@ -75,6 +82,8 @@ report = {
 }
 output_path = Path(args[args.index("--output-last-message") + 1])
 output_path.write_text(json.dumps(report), encoding="utf-8")
+print(json.dumps({"type": "item.completed", "item": {"text": "data:image/png;base64,PRIVATE-EVENT"}}), flush=True)
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1}}), flush=True)
 print("data:image/png;base64,RAW-STDOUT-MUST-NOT-ESCAPE")
 print("iVBORw0KGgoRAW-STDERR-MUST-NOT-ESCAPE", file=sys.stderr)
 '''
@@ -163,6 +172,12 @@ class ShimTests(unittest.TestCase):
         self.assertEqual(payload["status"], "ok")
         self.assertFalse(payload["meta"]["raw_worker_output_forwarded"])
         self.assertEqual(payload["meta"]["effective_model"], DEFAULT_MODEL)
+        diagnostics = payload["meta"]["diagnostics"]
+        self.assertEqual(diagnostics["phase"], "completed")
+        self.assertEqual(diagnostics["last_worker_event"], "turn_completed")
+        self.assertGreaterEqual(diagnostics["worker_events_seen"], 4)
+        self.assertFalse(diagnostics["raw_worker_output_forwarded"])
+        self.assertNotIn("PRIVATE-EVENT", result.stdout)
 
     def test_default_model_is_passed_to_worker(self) -> None:
         with tempfile.TemporaryDirectory() as name:
@@ -290,6 +305,100 @@ class ShimTests(unittest.TestCase):
         self.assertNotIn("FAILURE-STDERR", result.stdout)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["error"]["code"], "worker_failed")
+        self.assertEqual(payload["diagnostics"]["phase"], "worker")
+        self.assertEqual(payload["diagnostics"]["last_worker_event"], "error")
+        self.assertFalse(payload["diagnostics"]["raw_worker_output_forwarded"])
+
+    def test_complete_report_is_recovered_after_worker_timeout(self) -> None:
+        spec = importlib.util.spec_from_file_location("image_rollout_shim_runner", RUNNER)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        runner = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = runner
+        spec.loader.exec_module(runner)
+
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            image = self.make_image(directory)
+            source = runner.SourceImage(image, 96, 64, "PNG", "Fixture", image.stat().st_size)
+            attachment = runner.Attachment(
+                image,
+                {
+                    "id": "image-1-overview",
+                    "attachment_index": 1,
+                    "source_image": 1,
+                    "label": "Fixture",
+                    "kind": "overview",
+                    "original_size": [96, 64],
+                    "region_pixels": [0, 0, 96, 64],
+                },
+            )
+            request = self.base_request()
+            report = {
+                "schema_version": "1.0",
+                "summary": "Recovered complete report.",
+                "findings": [],
+                "answers": [],
+                "uncertainties": [],
+                "coverage": {
+                    "mode": "thorough",
+                    "source_images": 1,
+                    "attachments": 1,
+                    "reviewed_regions": ["image-1-overview"],
+                    "limitations": [],
+                },
+            }
+
+            class TimedOutProcess:
+                def __init__(self, command: list[str], **_: object) -> None:
+                    self.pid = 424242
+                    self.returncode = None
+                    self.stdin = io.BytesIO()
+                    self.stdout = io.BytesIO(
+                        b'{"type":"thread.started"}\n{"type":"turn.started"}\n'
+                    )
+                    output_path = Path(
+                        command[command.index("--output-last-message") + 1]
+                    )
+                    output_path.write_text(json.dumps(report), encoding="utf-8")
+
+                def wait(self, timeout: int | None = None) -> int:
+                    if timeout is not None:
+                        raise subprocess.TimeoutExpired("fake-codex", timeout)
+                    self.returncode = -9
+                    return self.returncode
+
+            diagnostics = runner.RunDiagnostics(
+                timeout_seconds=30,
+                effective_model=DEFAULT_MODEL,
+                reasoning_effort="high",
+            )
+            with (
+                mock.patch.object(runner.shutil, "which", return_value="/fake/codex"),
+                mock.patch.object(runner.subprocess, "Popen", TimedOutProcess),
+                mock.patch.object(runner.os, "killpg"),
+            ):
+                result = runner.run_worker(
+                    "worker prompt",
+                    [attachment],
+                    DEFAULT_MODEL,
+                    "high",
+                    30,
+                    directory,
+                    diagnostics,
+                )
+
+            validated = runner.validate_report(
+                result.report, request, [source], [attachment]
+            )
+            diagnostics.report_recovered_after_timeout = result.recovered_after_timeout
+
+        self.assertEqual(validated["summary"], "Recovered complete report.")
+        self.assertTrue(result.recovered_after_timeout)
+        self.assertTrue(diagnostics.final_report_present)
+        self.assertTrue(diagnostics.report_recovered_after_timeout)
+        self.assertEqual(diagnostics.worker_exit_code, -9)
+        self.assertEqual(diagnostics.last_worker_event, "turn_started")
 
     def test_incomplete_region_coverage_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as name:

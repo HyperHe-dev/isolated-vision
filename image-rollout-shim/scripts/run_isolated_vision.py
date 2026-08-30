@@ -13,8 +13,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +87,52 @@ class ShimError(Exception):
         self.code = code
 
 
+@dataclass
+class RunDiagnostics:
+    started_at: float = field(default_factory=time.monotonic, repr=False)
+    phase: str = "arguments"
+    source_images: int = 0
+    private_attachments: int = 0
+    source_bytes: int = 0
+    source_pixels: int = 0
+    timeout_seconds: int | None = None
+    effective_model: str | None = None
+    reasoning_effort: str | None = None
+    source_inspection_ms: int | None = None
+    attachment_preparation_ms: int | None = None
+    worker_ms: int | None = None
+    validation_ms: int | None = None
+    worker_events_seen: int = 0
+    last_worker_event: str | None = None
+    worker_exit_code: int | None = None
+    final_report_present: bool = False
+    report_recovered_after_timeout: bool = False
+    raw_worker_output_forwarded: bool = False
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "phase": self.phase,
+            "elapsed_ms": max(0, round((time.monotonic() - self.started_at) * 1000)),
+            "source_images": self.source_images,
+            "private_attachments": self.private_attachments,
+            "source_bytes": self.source_bytes,
+            "source_pixels": self.source_pixels,
+            "timeout_seconds": self.timeout_seconds,
+            "effective_model": self.effective_model,
+            "reasoning_effort": self.reasoning_effort,
+            "source_inspection_ms": self.source_inspection_ms,
+            "attachment_preparation_ms": self.attachment_preparation_ms,
+            "worker_ms": self.worker_ms,
+            "validation_ms": self.validation_ms,
+            "worker_events_seen": self.worker_events_seen,
+            "last_worker_event": self.last_worker_event,
+            "worker_exit_code": self.worker_exit_code,
+            "final_report_present": self.final_report_present,
+            "report_recovered_after_timeout": self.report_recovered_after_timeout,
+            "raw_worker_output_forwarded": self.raw_worker_output_forwarded,
+        }
+
+
 class SafeArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise ShimError("invalid_request")
@@ -97,12 +145,19 @@ class SourceImage:
     height: int
     format: str
     label: str
+    byte_size: int
 
 
 @dataclass(frozen=True)
 class Attachment:
     path: Path
     manifest: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class WorkerResult:
+    report: Any
+    recovered_after_timeout: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -151,7 +206,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args(raw_args)
 
 
-def emit_error(code: str) -> int:
+def emit_error(code: str, diagnostics: RunDiagnostics) -> int:
     safe_code = code if code in SAFE_ERROR_MESSAGES else "internal_error"
     payload = {
         "status": "error",
@@ -159,6 +214,7 @@ def emit_error(code: str) -> int:
             "code": safe_code,
             "message": SAFE_ERROR_MESSAGES[safe_code],
         },
+        "diagnostics": diagnostics.as_payload(),
     }
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
     sys.stdout.flush()
@@ -312,7 +368,7 @@ def inspect_sources(paths: list[str], labels: list[str]) -> list[SourceImage]:
         if width * height > MAX_IMAGE_PIXELS:
             raise ShimError("image_too_large")
         label = labels[index - 1] if labels else f"Image {index}"
-        sources.append(SourceImage(path, width, height, image_format, label))
+        sources.append(SourceImage(path, width, height, image_format, label, stat.st_size))
     return sources
 
 
@@ -452,6 +508,65 @@ ATTACHMENT_MANIFEST_JSON={json.dumps(manifest, ensure_ascii=False, separators=("
 """
 
 
+def classify_worker_event(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if value.startswith("item."):
+        return "item_activity"
+    return {
+        "thread.started": "thread_started",
+        "turn.started": "turn_started",
+        "turn.completed": "turn_completed",
+        "turn.failed": "turn_failed",
+        "error": "error",
+    }.get(value, "other")
+
+
+def consume_worker_events(stream: Any, diagnostics: RunDiagnostics) -> None:
+    try:
+        for raw_line in stream:
+            try:
+                event = json.loads(raw_line)
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            event_name = classify_worker_event(event.get("type"))
+            if event_name is None:
+                continue
+            diagnostics.worker_events_seen += 1
+            diagnostics.last_worker_event = event_name
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def load_worker_report(output_path: Path) -> Any:
+    if not output_path.is_file():
+        raise ShimError("missing_worker_output")
+    try:
+        output_size = output_path.stat().st_size
+    except OSError:
+        raise ShimError("missing_worker_output") from None
+    if output_size <= 0:
+        raise ShimError("missing_worker_output")
+    if output_size > MAX_OUTPUT_BYTES:
+        raise ShimError("unsafe_worker_output")
+    try:
+        raw_output = output_path.read_bytes()
+        text_output = raw_output.decode("utf-8")
+        assert_safe_text(text_output)
+        report = json.loads(text_output)
+    except ShimError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ShimError("invalid_worker_output") from None
+    assert_safe_tree(report)
+    return report
+
+
 def run_worker(
     prompt: str,
     attachments: list[Attachment],
@@ -459,7 +574,8 @@ def run_worker(
     reasoning_effort: str,
     timeout: int,
     private_dir: Path,
-) -> dict[str, Any]:
+    diagnostics: RunDiagnostics,
+) -> WorkerResult:
     configured_binary = os.environ.get("IMAGE_ROLLOUT_SHIM_CODEX", "codex")
     codex_binary = shutil.which(configured_binary)
     if codex_binary is None:
@@ -475,6 +591,7 @@ def run_worker(
     command = [
         codex_binary,
         "exec",
+        "--json",
         "--ephemeral",
         "--skip-git-repo-check",
         "--sandbox",
@@ -503,45 +620,58 @@ def run_worker(
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         cwd=work_dir,
         env=environment,
         start_new_session=True,
     )
+    if process.stdin is None or process.stdout is None:
+        raise ShimError("internal_error")
+    event_thread = threading.Thread(
+        target=consume_worker_events,
+        args=(process.stdout, diagnostics),
+        name="image-rollout-shim-events",
+        daemon=True,
+    )
+    event_thread.start()
+    timed_out = False
     try:
-        process.communicate(prompt.encode("utf-8"), timeout=timeout)
+        try:
+            process.stdin.write(prompt.encode("utf-8"))
+        except BrokenPipeError:
+            pass
+        finally:
+            try:
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+        process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        timed_out = True
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         process.wait()
+    finally:
+        event_thread.join(timeout=5)
+
+    diagnostics.worker_exit_code = process.returncode
+    diagnostics.final_report_present = output_path.is_file()
+
+    if timed_out:
+        if diagnostics.final_report_present:
+            try:
+                return WorkerResult(load_worker_report(output_path), True)
+            except ShimError as error:
+                if error.code == "unsafe_worker_output":
+                    raise
         raise ShimError("worker_timeout") from None
 
     if process.returncode != 0:
         raise ShimError("worker_failed")
-    if not output_path.is_file():
-        raise ShimError("missing_worker_output")
-    try:
-        output_size = output_path.stat().st_size
-    except OSError:
-        raise ShimError("missing_worker_output") from None
-    if output_size <= 0:
-        raise ShimError("missing_worker_output")
-    if output_size > MAX_OUTPUT_BYTES:
-        raise ShimError("unsafe_worker_output")
-    try:
-        raw_output = output_path.read_bytes()
-        text_output = raw_output.decode("utf-8")
-        assert_safe_text(text_output)
-        report = json.loads(text_output)
-    except ShimError:
-        raise
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        raise ShimError("invalid_worker_output") from None
-    assert_safe_tree(report)
-    return report
+    return WorkerResult(load_worker_report(output_path), False)
 
 
 def expect_exact_keys(value: Any, expected: set[str]) -> dict[str, Any]:
@@ -658,26 +788,75 @@ def validate_report(
 
 
 def main() -> int:
+    diagnostics = RunDiagnostics()
     try:
         args = parse_args()
         if not 30 <= args.timeout <= 1800:
             raise ShimError("invalid_request")
+        diagnostics.timeout_seconds = args.timeout
+        diagnostics.reasoning_effort = args.reasoning_effort
         model = effective_model(args.model)
+        diagnostics.effective_model = model
+
+        diagnostics.phase = "request"
         request = read_request()
-        sources = inspect_sources(args.image, request["image_labels"])
+
+        diagnostics.phase = "sources"
+        stage_started = time.monotonic()
+        try:
+            sources = inspect_sources(args.image, request["image_labels"])
+        finally:
+            diagnostics.source_inspection_ms = max(
+                0, round((time.monotonic() - stage_started) * 1000)
+            )
+        diagnostics.source_images = len(sources)
+        diagnostics.source_bytes = sum(source.byte_size for source in sources)
+        diagnostics.source_pixels = sum(source.width * source.height for source in sources)
+
+        diagnostics.phase = "attachments"
         with create_private_workspace() as private_name:
             private_dir = Path(private_name)
-            attachments = prepare_attachments(sources, request["mode"], private_dir)
+            stage_started = time.monotonic()
+            try:
+                attachments = prepare_attachments(sources, request["mode"], private_dir)
+            finally:
+                diagnostics.attachment_preparation_ms = max(
+                    0, round((time.monotonic() - stage_started) * 1000)
+                )
+            diagnostics.private_attachments = len(attachments)
             prompt = build_worker_prompt(request, attachments)
-            report = run_worker(
-                prompt,
-                attachments,
-                model,
-                args.reasoning_effort,
-                args.timeout,
-                private_dir,
+
+            diagnostics.phase = "worker"
+            stage_started = time.monotonic()
+            try:
+                worker_result = run_worker(
+                    prompt,
+                    attachments,
+                    model,
+                    args.reasoning_effort,
+                    args.timeout,
+                    private_dir,
+                    diagnostics,
+                )
+            finally:
+                diagnostics.worker_ms = max(
+                    0, round((time.monotonic() - stage_started) * 1000)
+                )
+
+            diagnostics.phase = "validation"
+            stage_started = time.monotonic()
+            try:
+                validated = validate_report(
+                    worker_result.report, request, sources, attachments
+                )
+            finally:
+                diagnostics.validation_ms = max(
+                    0, round((time.monotonic() - stage_started) * 1000)
+                )
+            diagnostics.report_recovered_after_timeout = (
+                worker_result.recovered_after_timeout
             )
-            validated = validate_report(report, request, sources, attachments)
+            diagnostics.phase = "completed"
             payload = {
                 "status": "ok",
                 "report": validated,
@@ -688,6 +867,8 @@ def main() -> int:
                     "worker_session": "ephemeral",
                     "raw_worker_output_forwarded": False,
                     "effective_model": model,
+                    "reasoning_effort": args.reasoning_effort,
+                    "diagnostics": diagnostics.as_payload(),
                 },
             }
             output = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -698,11 +879,11 @@ def main() -> int:
             sys.stdout.flush()
             return 0
     except ShimError as error:
-        return emit_error(error.code)
+        return emit_error(error.code, diagnostics)
     except KeyboardInterrupt:
-        return emit_error("interrupted")
+        return emit_error("interrupted", diagnostics)
     except Exception:
-        return emit_error("internal_error")
+        return emit_error("internal_error", diagnostics)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,93 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "diagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "elapsed_ms",
+        "source_images",
+        "private_attachments",
+        "source_bytes",
+        "source_pixels",
+        "timeout_seconds",
+        "effective_model",
+        "reasoning_effort",
+        "source_inspection_ms",
+        "attachment_preparation_ms",
+        "worker_ms",
+        "validation_ms",
+        "worker_events_seen",
+        "last_worker_event",
+        "worker_exit_code",
+        "final_report_present",
+        "report_recovered_after_timeout",
+        "raw_worker_output_forwarded"
+      ],
+      "properties": {
+        "phase": {
+          "type": "string",
+          "enum": [
+            "arguments",
+            "request",
+            "sources",
+            "attachments",
+            "worker",
+            "validation",
+            "completed"
+          ]
+        },
+        "elapsed_ms": {"type": "integer", "minimum": 0},
+        "source_images": {"type": "integer", "minimum": 0, "maximum": 8},
+        "private_attachments": {"type": "integer", "minimum": 0, "maximum": 48},
+        "source_bytes": {"type": "integer", "minimum": 0},
+        "source_pixels": {"type": "integer", "minimum": 0},
+        "timeout_seconds": {
+          "type": ["integer", "null"],
+          "minimum": 30,
+          "maximum": 1800
+        },
+        "effective_model": {
+          "anyOf": [
+            {"type": "null"},
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@+\\-]{0,127}$"
+            }
+          ]
+        },
+        "reasoning_effort": {
+          "type": ["string", "null"],
+          "enum": ["low", "medium", "high", "xhigh", "max", "ultra", null]
+        },
+        "source_inspection_ms": {"type": ["integer", "null"], "minimum": 0},
+        "attachment_preparation_ms": {"type": ["integer", "null"], "minimum": 0},
+        "worker_ms": {"type": ["integer", "null"], "minimum": 0},
+        "validation_ms": {"type": ["integer", "null"], "minimum": 0},
+        "worker_events_seen": {"type": "integer", "minimum": 0},
+        "last_worker_event": {
+          "type": ["string", "null"],
+          "enum": [
+            "thread_started",
+            "turn_started",
+            "turn_completed",
+            "turn_failed",
+            "item_activity",
+            "error",
+            "other",
+            null
+          ]
+        },
+        "worker_exit_code": {"type": ["integer", "null"]},
+        "final_report_present": {"type": "boolean"},
+        "report_recovered_after_timeout": {"type": "boolean"},
+        "raw_worker_output_forwarded": {"const": false}
+      }
+    }
+  },
   "oneOf": [
     {
       "type": "object",
@@ -17,7 +105,9 @@
             "private_attachments",
             "worker_session",
             "raw_worker_output_forwarded",
-            "effective_model"
+            "effective_model",
+            "reasoning_effort",
+            "diagnostics"
           ],
           "properties": {
             "mode": {"type": "string", "enum": ["standard", "thorough"]},
@@ -30,7 +120,12 @@
               "minLength": 1,
               "maxLength": 128,
               "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@+\\-]{0,127}$"
-            }
+            },
+            "reasoning_effort": {
+              "type": "string",
+              "enum": ["low", "medium", "high", "xhigh", "max", "ultra"]
+            },
+            "diagnostics": {"$ref": "#/$defs/diagnostics"}
           }
         }
       }
@@ -38,7 +133,7 @@
     {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "error"],
+      "required": ["status", "error", "diagnostics"],
       "properties": {
         "status": {"const": "error"},
         "error": {
@@ -49,7 +144,8 @@
             "code": {"type": "string"},
             "message": {"type": "string"}
           }
-        }
+        },
+        "diagnostics": {"$ref": "#/$defs/diagnostics"}
       }
     }
   ]
