@@ -186,6 +186,36 @@ class VisionTests(unittest.TestCase):
         finally:
             close_handle(handle)
 
+    def reap_process(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
+            process.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate(timeout=15)
+
+    def force_stop_pid(self, process_id: int) -> None:
+        if not self.process_is_alive(process_id):
+            return
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process_id), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return
+        try:
+            os.kill(process_id, 9)
+        except (ProcessLookupError, PermissionError):
+            pass
+
     def windows_acl_sddl(self, path: Path) -> str:
         import ctypes
         from ctypes import wintypes
@@ -246,6 +276,115 @@ class VisionTests(unittest.TestCase):
         finally:
             if sddl:
                 local_free(sddl)
+            if security_descriptor:
+                local_free(security_descriptor)
+
+    def windows_acl_grants_full_access(self, path: Path, sid: str) -> bool:
+        import ctypes
+        from ctypes import wintypes
+
+        class Acl(ctypes.Structure):
+            _fields_ = [
+                ("revision", wintypes.BYTE),
+                ("reserved_1", wintypes.BYTE),
+                ("size", wintypes.WORD),
+                ("ace_count", wintypes.WORD),
+                ("reserved_2", wintypes.WORD),
+            ]
+
+        class AceHeader(ctypes.Structure):
+            _fields_ = [
+                ("ace_type", wintypes.BYTE),
+                ("ace_flags", wintypes.BYTE),
+                ("ace_size", wintypes.WORD),
+            ]
+
+        class AccessAllowedAce(ctypes.Structure):
+            _fields_ = [
+                ("header", AceHeader),
+                ("mask", wintypes.DWORD),
+                ("sid_start", wintypes.DWORD),
+            ]
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        security_descriptor = wintypes.LPVOID()
+        dacl = wintypes.LPVOID()
+        expected_sid = wintypes.LPVOID()
+
+        get_named_security = advapi32.GetNamedSecurityInfoW
+        get_named_security.argtypes = [
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+        ]
+        get_named_security.restype = wintypes.DWORD
+        get_ace = advapi32.GetAce
+        get_ace.argtypes = [
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPVOID),
+        ]
+        get_ace.restype = wintypes.BOOL
+        convert_sid = advapi32.ConvertStringSidToSidW
+        convert_sid.argtypes = [
+            wintypes.LPCWSTR,
+            ctypes.POINTER(wintypes.LPVOID),
+        ]
+        convert_sid.restype = wintypes.BOOL
+        equal_sid = advapi32.EqualSid
+        equal_sid.argtypes = [wintypes.LPVOID, wintypes.LPVOID]
+        equal_sid.restype = wintypes.BOOL
+        local_free = kernel32.LocalFree
+        local_free.argtypes = [wintypes.LPVOID]
+        local_free.restype = wintypes.LPVOID
+
+        error = get_named_security(
+            str(path),
+            1,
+            0x00000004,
+            None,
+            None,
+            ctypes.byref(dacl),
+            None,
+            ctypes.byref(security_descriptor),
+        )
+        if error:
+            raise ctypes.WinError(error)
+        try:
+            if not convert_sid(sid, ctypes.byref(expected_sid)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not dacl:
+                return False
+            acl = ctypes.cast(dacl, ctypes.POINTER(Acl)).contents
+            for index in range(acl.ace_count):
+                ace_pointer = wintypes.LPVOID()
+                if not get_ace(dacl, index, ctypes.byref(ace_pointer)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                header = ctypes.cast(
+                    ace_pointer, ctypes.POINTER(AceHeader)
+                ).contents
+                if header.ace_type != 0:
+                    continue
+                ace = ctypes.cast(
+                    ace_pointer, ctypes.POINTER(AccessAllowedAce)
+                ).contents
+                ace_sid = wintypes.LPVOID(
+                    ace_pointer.value + AccessAllowedAce.sid_start.offset
+                )
+                if equal_sid(expected_sid, ace_sid) and (
+                    ace.mask & 0x001F01FF
+                ) == 0x001F01FF:
+                    return True
+            return False
+        finally:
+            if expected_sid:
+                local_free(expected_sid)
             if security_descriptor:
                 local_free(security_descriptor)
 
@@ -609,42 +748,53 @@ class VisionTests(unittest.TestCase):
                     subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
                 ),
             )
-            self.assertIsNotNone(process.stdin)
-            process.stdin.write(json.dumps(self.base_request()))
-            process.stdin.close()
-            process.stdin = None
+            worker_pid: int | None = None
+            try:
+                self.assertIsNotNone(process.stdin)
+                process.stdin.write(json.dumps(self.base_request()))
+                process.stdin.close()
+                process.stdin = None
 
-            deadline = time.monotonic() + 10
-            while not ready_path.is_file() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            self.assertTrue(ready_path.is_file(), "worker did not start")
-            worker_pid = int(ready_path.read_text(encoding="utf-8"))
-            if os.name == "nt":
-                workspaces = list(private_root.glob("isolated-vision-*"))
-                self.assertEqual(len(workspaces), 1)
-                runner = self.load_runner()
-                self.assertIn(
-                    runner.windows_current_user_sid(),
-                    self.windows_acl_sddl(workspaces[0]),
-                )
+                deadline = time.monotonic() + 10
+                while not ready_path.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(ready_path.is_file(), "worker did not start")
+                worker_pid = int(ready_path.read_text(encoding="utf-8"))
+                if os.name == "nt":
+                    workspaces = list(private_root.glob("isolated-vision-*"))
+                    self.assertEqual(len(workspaces), 1)
+                    runner = self.load_runner()
+                    self.assertTrue(
+                        self.windows_acl_grants_full_access(
+                            workspaces[0], runner.windows_current_user_sid()
+                        )
+                    )
 
-            process.terminate()
-            stdout, stderr = process.communicate(timeout=15)
-            if os.name != "nt":
-                payload = json.loads(stdout)
-                self.assertEqual(process.returncode, 2)
-                self.assertEqual(stderr, "")
-                self.assertEqual(payload["error"]["code"], "interrupted")
-                self.assertEqual(list(private_root.glob("isolated-vision-*")), [])
-            else:
-                self.assertNotEqual(process.returncode, 0)
+                process.terminate()
+                stdout, stderr = process.communicate(timeout=15)
+                if os.name != "nt":
+                    payload = json.loads(stdout)
+                    self.assertEqual(process.returncode, 2)
+                    self.assertEqual(stderr, "")
+                    self.assertEqual(payload["error"]["code"], "interrupted")
+                    self.assertEqual(
+                        list(private_root.glob("isolated-vision-*")), []
+                    )
+                else:
+                    self.assertNotEqual(process.returncode, 0)
 
-            deadline = time.monotonic() + 5
-            worker_alive = self.process_is_alive(worker_pid)
-            while worker_alive and time.monotonic() < deadline:
-                time.sleep(0.05)
+                deadline = time.monotonic() + 5
                 worker_alive = self.process_is_alive(worker_pid)
-            self.assertFalse(worker_alive, "worker survived launcher termination")
+                while worker_alive and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                    worker_alive = self.process_is_alive(worker_pid)
+                self.assertFalse(
+                    worker_alive, "worker survived launcher termination"
+                )
+            finally:
+                self.reap_process(process)
+                if worker_pid is not None:
+                    self.force_stop_pid(worker_pid)
 
     def test_worker_process_tree_termination_is_cross_platform(self) -> None:
         runner = self.load_runner()
@@ -718,14 +868,28 @@ class VisionTests(unittest.TestCase):
                 sddl = self.windows_acl_sddl(job_directory)
                 self.assertIn("D:P", sddl)
                 user_sid = runner.windows_current_user_sid()
-                self.assertIn(user_sid, sddl)
-                self.assertIn(
-                    user_sid,
-                    self.windows_acl_sddl(job_directory / "status.json"),
+                self.assertTrue(
+                    self.windows_acl_grants_full_access(job_directory, user_sid)
                 )
-                self.assertIn(
-                    user_sid,
-                    self.windows_acl_sddl(job_directory / "result.json"),
+                self.assertTrue(
+                    self.windows_acl_grants_full_access(
+                        job_directory, "S-1-5-18"
+                    )
+                )
+                self.assertTrue(
+                    self.windows_acl_grants_full_access(
+                        job_directory, "S-1-5-32-544"
+                    )
+                )
+                self.assertTrue(
+                    self.windows_acl_grants_full_access(
+                        job_directory / "status.json", user_sid
+                    )
+                )
+                self.assertTrue(
+                    self.windows_acl_grants_full_access(
+                        job_directory / "result.json", user_sid
+                    )
                 )
 
             cleanup_result = self.run_job_command("cleanup", job_id, job_root)
