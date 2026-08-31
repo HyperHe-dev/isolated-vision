@@ -1,46 +1,53 @@
 # Security model
 
-Image Rollout Shim is designed to reduce one specific kind of parent-rollout
-exposure. It is not a general security boundary.
+Image Rollout Shim reduces one kind of parent-rollout exposure. It is not a
+general security boundary.
 
-## Intended protection
+## Protected path
 
-When the parent routes an absolute local image path through the Skill before any
-image-bearing tool call:
+Protection applies only when the parent routes an absolute local image path
+through the Skill before any image-bearing tool call:
 
-- the child receives the image through `codex exec --image`;
-- the child session is launched with `--ephemeral`;
-- child JSONL stdout is consumed privately, only fixed event categories and
-  aggregate timings are retained, and raw event payloads plus stderr are discarded;
-- only a schema-validated JSON report is returned;
-- Data URLs, base64-like payloads, image signatures, image-bearing keys, Markdown
-  images, and HTML image tags are rejected;
-- incomplete attachment coverage and malformed reports fail closed.
-- a report found after timeout is returned only if the ordinary safety, schema,
-  and attachment-coverage validation still succeeds.
+- an ephemeral child receives the image through `codex exec --image`;
+- the launcher consumes child stdout privately and discards raw JSONL payloads
+  and stderr;
+- a run-specific schema fixes the expected mode, source indices, attachment IDs,
+  and counts;
+- only a validated JSON report and fixed diagnostics reach the parent;
+- Data URLs, base64-like data, image signatures and keys, Markdown images, HTML
+  image tags, malformed reports, and incomplete coverage fail closed;
+- handled timeouts and interrupts terminate the worker process group and remove
+  the private image workspace;
+- optional job records contain only coarse status and the validated result. Files
+  are `0600` inside a `0700` text-only directory.
+
+A report recovered after timeout must pass the same safety, schema, and coverage
+checks as an ordinary result.
 
 ## Outside the boundary
 
-- Skill selection is behavioral. There is no Hook that forcibly intercepts
-  `view_image`.
-- Images already attached to the parent or returned inline by another tool cannot
+- Skill selection is behavioral; no Hook forcibly intercepts `view_image`.
+- Pixels already attached to the parent or returned inline by another tool cannot
   be removed retroactively.
-- The child uses the same operating-system account, Codex authentication, process
-  environment, and locally readable filesystem permitted by its sandbox.
-- The image is still sent through the normal Codex model path. `--ephemeral`
-  concerns local session persistence; it does not change service-side data policy.
-- The worker is instructed not to use tools or obey visible image text, but model
-  instructions are not an OS-level control.
-- Pillow decodes source images locally. Keep Pillow current and use an additional
-  hardened sandbox for hostile or untrusted files.
-- A text report can omit details, misread pixels, or make incorrect inferences.
+- The child uses the same OS account, Codex authentication, environment, and
+  filesystem access allowed by its sandbox.
+- Images still travel through the normal Codex model path. `--ephemeral` changes
+  local session persistence, not service-side data policy.
+- A normal link to a reviewed source may be fetched or proxied by the Codex UI.
+  That UI-side transfer is outside this boundary; omit such links for sensitive
+  material.
+- Worker instructions are not an OS control. Pillow decodes source files locally,
+  so keep it current and sandbox hostile inputs separately.
+- Text reports can be incomplete or wrong. Recoverable job records persist until
+  cleanup and may contain sensitive conclusions.
+- `SIGKILL`, host crashes, or power loss may leave temporary workspaces or job
+  records behind.
 
 Do not use this project as the sole control for secrets, regulated data, hostile
-files, or environments where the child must not be able to read local data.
+files, or environments where the child must not read other local data.
 
 ## Reporting a vulnerability
 
-Prefer GitHub's private vulnerability-reporting feature when it is enabled for the
-repository. Otherwise, open an issue containing only a minimal, non-sensitive
-description and ask the maintainer for a private reporting channel. Never attach
-sensitive images, transcripts, credentials, or raw rollout data to a public issue.
+Use GitHub private vulnerability reporting when available. Otherwise, open a
+minimal non-sensitive issue and ask for a private channel. Never publish sensitive
+images, transcripts, credentials, or raw rollout data.

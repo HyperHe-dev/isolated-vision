@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -17,6 +18,7 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "image-rollout-shim" / "scripts" / "run_isolated_vision.py"
+LAUNCHER_SCHEMA = RUNNER.with_name("launcher-output.schema.json")
 DEFAULT_MODEL = "gpt-5.6-sol"
 
 
@@ -24,6 +26,7 @@ FAKE_CODEX = r'''#!/usr/bin/env python3
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 args = sys.argv[1:]
@@ -41,6 +44,10 @@ if expected_model is not None and model != expected_model:
 capture_path = os.environ.get("FAKE_CODEX_ARGS_CAPTURE")
 if capture_path:
     Path(capture_path).write_text(json.dumps(args), encoding="utf-8")
+schema_capture_path = os.environ.get("FAKE_CODEX_SCHEMA_CAPTURE")
+if schema_capture_path:
+    schema_path = Path(args[args.index("--output-schema") + 1])
+    Path(schema_capture_path).write_text(schema_path.read_text(encoding="utf-8"), encoding="utf-8")
 
 prompt = sys.stdin.read()
 if "[image-rollout-shim-worker:v1]" not in prompt:
@@ -48,6 +55,13 @@ if "[image-rollout-shim-worker:v1]" not in prompt:
 
 print(json.dumps({"type": "thread.started", "thread_id": "private-worker"}), flush=True)
 print(json.dumps({"type": "turn.started"}), flush=True)
+
+ready_path = os.environ.get("FAKE_CODEX_READY")
+if ready_path:
+    Path(ready_path).write_text(str(os.getpid()), encoding="utf-8")
+sleep_seconds = float(os.environ.get("FAKE_CODEX_SLEEP_SECONDS", "0"))
+if sleep_seconds:
+    time.sleep(sleep_seconds)
 
 request_line = next(line for line in prompt.splitlines() if line.startswith("REQUEST_JSON="))
 manifest_line = next(line for line in prompt.splitlines() if line.startswith("ATTACHMENT_MANIFEST_JSON="))
@@ -63,15 +77,28 @@ if os.environ.get("FAKE_CODEX_FAIL") == "1":
     raise SystemExit(37)
 summary = "data:image/png;base64,LEAK-MUST-NOT-ESCAPE" if unsafe else "Inspection completed."
 report = {
-    "schema_version": "1.0",
+    "schema_version": "1.1",
     "summary": summary,
     "findings": [],
-    "answers": [],
+    "answers": [
+        {
+            "question_index": (
+                len(request["questions"]) + 1
+                if os.environ.get("FAKE_CODEX_BAD_QUESTION") == "1"
+                else question_index
+            ),
+            "answer": "Synthetic answer.",
+            "confidence": 0.9,
+        }
+        for question_index, _question in enumerate(request["questions"], start=1)
+    ],
     "uncertainties": [],
     "coverage": {
         "mode": request["mode"],
         "source_images": source_count,
-        "attachments": len(manifest),
+        "attachments": len(manifest) + (
+            1 if os.environ.get("FAKE_CODEX_BAD_ATTACHMENT_COUNT") == "1" else 0
+        ),
         "reviewed_regions": (
             [item["id"] for item in manifest[:-1]]
             if os.environ.get("FAKE_CODEX_INCOMPLETE") == "1"
@@ -90,6 +117,17 @@ print("iVBORw0KGgoRAW-STDERR-MUST-NOT-ESCAPE", file=sys.stderr)
 
 
 class ShimTests(unittest.TestCase):
+    def load_runner(self) -> object:
+        spec = importlib.util.spec_from_file_location(
+            "image_rollout_shim_runner", RUNNER
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        runner = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = runner
+        spec.loader.exec_module(runner)
+        return runner
+
     def make_image(self, directory: Path, size: tuple[int, int] = (96, 64)) -> Path:
         path = directory / "fixture.png"
         Image.new("RGB", size, (24, 80, 140)).save(path)
@@ -113,6 +151,11 @@ class ShimTests(unittest.TestCase):
         model: str | None = None,
         expected_model: str | None = DEFAULT_MODEL,
         args_capture: Path | None = None,
+        schema_capture: Path | None = None,
+        bad_attachment_count: bool = False,
+        bad_question: bool = False,
+        job_id: str | None = None,
+        job_root: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["IMAGE_ROLLOUT_SHIM_CODEX"] = str(fake_codex)
@@ -126,6 +169,14 @@ class ShimTests(unittest.TestCase):
             environment["FAKE_CODEX_EXPECT_MODEL"] = expected_model
         if args_capture is not None:
             environment["FAKE_CODEX_ARGS_CAPTURE"] = str(args_capture)
+        if schema_capture is not None:
+            environment["FAKE_CODEX_SCHEMA_CAPTURE"] = str(schema_capture)
+        if bad_attachment_count:
+            environment["FAKE_CODEX_BAD_ATTACHMENT_COUNT"] = "1"
+        if bad_question:
+            environment["FAKE_CODEX_BAD_QUESTION"] = "1"
+        if job_root is not None:
+            environment["IMAGE_ROLLOUT_SHIM_JOB_ROOT"] = str(job_root)
         command = [
             sys.executable,
             str(RUNNER),
@@ -136,6 +187,8 @@ class ShimTests(unittest.TestCase):
         ]
         if model is not None:
             command.extend(["--model", model])
+        if job_id is not None:
+            command.extend(["--job-id", job_id])
         return subprocess.run(
             command,
             input=json.dumps(request),
@@ -143,6 +196,29 @@ class ShimTests(unittest.TestCase):
             capture_output=True,
             env=environment,
             timeout=60,
+            check=False,
+        )
+
+    def run_job_command(
+        self,
+        command: str,
+        job_id: str,
+        job_root: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment["IMAGE_ROLLOUT_SHIM_JOB_ROOT"] = str(job_root)
+        return subprocess.run(
+            [
+                sys.executable,
+                str(RUNNER),
+                command,
+                "--job-id",
+                job_id,
+            ],
+            text=True,
+            capture_output=True,
+            env=environment,
+            timeout=15,
             check=False,
         )
 
@@ -170,13 +246,15 @@ class ShimTests(unittest.TestCase):
         self.assertNotIn("RAW-STDERR", result.stdout)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["status"], "ok")
-        self.assertFalse(payload["meta"]["raw_worker_output_forwarded"])
-        self.assertEqual(payload["meta"]["effective_model"], DEFAULT_MODEL)
-        diagnostics = payload["meta"]["diagnostics"]
+        self.assertEqual(set(payload), {"status", "report", "diagnostics"})
+        diagnostics = payload["diagnostics"]
+        self.assertEqual(diagnostics["effective_model"], DEFAULT_MODEL)
+        launcher_schema = json.loads(LAUNCHER_SCHEMA.read_text(encoding="utf-8"))
+        required_diagnostics = launcher_schema["$defs"]["diagnostics"]["required"]
+        self.assertEqual(set(diagnostics), set(required_diagnostics))
         self.assertEqual(diagnostics["phase"], "completed")
         self.assertEqual(diagnostics["last_worker_event"], "turn_completed")
         self.assertGreaterEqual(diagnostics["worker_events_seen"], 4)
-        self.assertFalse(diagnostics["raw_worker_output_forwarded"])
         self.assertNotIn("PRIVATE-EVENT", result.stdout)
 
     def test_default_model_is_passed_to_worker(self) -> None:
@@ -189,7 +267,7 @@ class ShimTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stdout)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["meta"]["effective_model"], DEFAULT_MODEL)
+        self.assertEqual(payload["diagnostics"]["effective_model"], DEFAULT_MODEL)
 
     def test_explicit_model_is_passed_and_reported(self) -> None:
         with tempfile.TemporaryDirectory() as name:
@@ -204,7 +282,7 @@ class ShimTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stdout)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["meta"]["effective_model"], model)
+        self.assertEqual(payload["diagnostics"]["effective_model"], model)
 
     def test_empty_model_falls_back_to_default(self) -> None:
         for model in ("", "   "):
@@ -218,7 +296,9 @@ class ShimTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stdout)
                 payload = json.loads(result.stdout)
-                self.assertEqual(payload["meta"]["effective_model"], DEFAULT_MODEL)
+                self.assertEqual(
+                    payload["diagnostics"]["effective_model"], DEFAULT_MODEL
+                )
 
     def test_invalid_model_identifiers_are_rejected(self) -> None:
         invalid_models = (
@@ -240,7 +320,8 @@ class ShimTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 2)
                 payload = json.loads(result.stdout)
-                self.assertEqual(payload["error"]["code"], "invalid_model")
+                expected = "invalid_request" if model == "--config" else "invalid_model"
+                self.assertEqual(payload["error"]["code"], expected)
 
     def test_model_is_one_distinct_codex_argument(self) -> None:
         with tempfile.TemporaryDirectory() as name:
@@ -285,11 +366,310 @@ class ShimTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stdout)
         payload = json.loads(result.stdout)
-        self.assertGreater(payload["meta"]["private_attachments"], 1)
+        self.assertGreater(payload["diagnostics"]["private_attachments"], 1)
         self.assertEqual(
-            payload["meta"]["private_attachments"],
+            payload["diagnostics"]["private_attachments"],
             len(payload["report"]["coverage"]["reviewed_regions"]),
         )
+
+    def test_runtime_schema_binds_run_specific_counts_and_indices(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            schema_capture = directory / "runtime-schema.json"
+            request = self.base_request()
+            request["questions"] = ["Is the fixture visually complete?"]
+            result = self.run_shim(
+                self.make_image(directory, (3500, 2200)),
+                self.make_fake_codex(directory),
+                request,
+                schema_capture=schema_capture,
+            )
+            schema = json.loads(schema_capture.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        payload = json.loads(result.stdout)
+        attachment_count = payload["diagnostics"]["private_attachments"]
+        properties = schema["properties"]
+        image_index = properties["findings"]["items"]["properties"]["location"][
+            "properties"
+        ]["image_index"]
+        coverage = properties["coverage"]["properties"]
+        reviewed = coverage["reviewed_regions"]
+        answers = properties["answers"]
+        self.assertEqual(image_index["maximum"], 1)
+        self.assertEqual(coverage["mode"]["enum"], ["thorough"])
+        self.assertEqual(coverage["source_images"]["enum"], [1])
+        self.assertEqual(coverage["attachments"]["enum"], [attachment_count])
+        self.assertEqual(reviewed["minItems"], attachment_count)
+        self.assertEqual(reviewed["maxItems"], attachment_count)
+        self.assertEqual(len(reviewed["items"]["enum"]), attachment_count)
+        self.assertEqual(answers["minItems"], 1)
+        self.assertEqual(answers["maxItems"], 1)
+        self.assertEqual(
+            answers["items"]["properties"]["question_index"]["enum"],
+            [1],
+        )
+
+    def test_invalid_report_identifies_safe_validation_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            result = self.run_shim(
+                self.make_image(directory),
+                self.make_fake_codex(directory),
+                self.base_request(),
+                bad_attachment_count=True,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["code"], "invalid_worker_output")
+        self.assertEqual(
+            payload["diagnostics"]["validation_rule"],
+            "coverage_attachment_count",
+        )
+        self.assertNotIn("Inspection completed", result.stdout)
+
+    def test_every_requested_question_must_be_answered_exactly_once(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            request = self.base_request()
+            request["questions"] = ["Is the fixture visually complete?"]
+            result = self.run_shim(
+                self.make_image(directory),
+                self.make_fake_codex(directory),
+                request,
+                bad_question=True,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["code"], "invalid_worker_output")
+        self.assertEqual(payload["diagnostics"]["validation_rule"], "answers")
+
+    def test_sigterm_stops_worker_and_removes_private_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            private_root = directory / "private-root"
+            private_root.mkdir()
+            ready_path = directory / "worker.pid"
+            environment = os.environ.copy()
+            environment["IMAGE_ROLLOUT_SHIM_CODEX"] = str(
+                self.make_fake_codex(directory)
+            )
+            environment["FAKE_CODEX_EXPECT_MODEL"] = DEFAULT_MODEL
+            environment["FAKE_CODEX_READY"] = str(ready_path)
+            environment["FAKE_CODEX_SLEEP_SECONDS"] = "30"
+            environment["TMPDIR"] = str(private_root)
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(RUNNER),
+                    "--image",
+                    str(self.make_image(directory, (3500, 2200))),
+                    "--timeout",
+                    "30",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=environment,
+            )
+            self.assertIsNotNone(process.stdin)
+            process.stdin.write(json.dumps(self.base_request()))
+            process.stdin.close()
+            process.stdin = None
+
+            deadline = time.monotonic() + 10
+            while not ready_path.is_file() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(ready_path.is_file(), "worker did not start")
+            worker_pid = int(ready_path.read_text(encoding="utf-8"))
+
+            process.terminate()
+            stdout, stderr = process.communicate(timeout=15)
+            payload = json.loads(stdout)
+            self.assertEqual(process.returncode, 2)
+            self.assertEqual(stderr, "")
+            self.assertEqual(payload["error"]["code"], "interrupted")
+            self.assertEqual(list(private_root.glob("image-rollout-shim-*")), [])
+
+            deadline = time.monotonic() + 5
+            worker_alive = True
+            while worker_alive and time.monotonic() < deadline:
+                try:
+                    os.kill(worker_pid, 0)
+                except ProcessLookupError:
+                    worker_alive = False
+                else:
+                    time.sleep(0.05)
+            self.assertFalse(worker_alive, "worker survived launcher termination")
+
+    def test_job_result_can_be_collected_after_the_run_session_is_gone(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            job_root = directory / "jobs"
+            job_id = "recoverable-run-01"
+            result = self.run_shim(
+                self.make_image(directory),
+                self.make_fake_codex(directory),
+                self.base_request(),
+                job_id=job_id,
+                job_root=job_root,
+            )
+            status_result = self.run_job_command("status", job_id, job_root)
+            collect_result = self.run_job_command("collect", job_id, job_root)
+
+            job_directory = job_root / job_id
+            self.assertEqual(oct(job_directory.stat().st_mode & 0o777), "0o700")
+            self.assertEqual(
+                oct((job_directory / "status.json").stat().st_mode & 0o777),
+                "0o600",
+            )
+            self.assertEqual(
+                oct((job_directory / "result.json").stat().st_mode & 0o777),
+                "0o600",
+            )
+
+            cleanup_result = self.run_job_command("cleanup", job_id, job_root)
+            self.assertFalse(job_directory.exists())
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(status_result.returncode, 0, status_result.stdout)
+        status = json.loads(status_result.stdout)
+        self.assertEqual(status["status"], "ok")
+        self.assertEqual(status["state"], "succeeded")
+        self.assertEqual(status["phase"], "completed")
+        self.assertGreaterEqual(status["elapsed_ms"], 0)
+        self.assertNotIn("result_ready", status)
+        self.assertNotIn("idle_ms", status)
+        self.assertNotIn("fixture.png", status_result.stdout)
+        self.assertNotIn("PRIVATE-EVENT", status_result.stdout)
+        self.assertEqual(collect_result.returncode, 0, collect_result.stdout)
+        self.assertEqual(json.loads(collect_result.stdout), json.loads(result.stdout))
+        self.assertEqual(cleanup_result.returncode, 0, cleanup_result.stdout)
+
+    def test_live_job_status_and_pending_collect_are_content_free(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            private_root = directory / "private-root"
+            private_root.mkdir()
+            job_root = directory / "jobs"
+            job_id = "live-run-01"
+            ready_path = directory / "worker.pid"
+            environment = os.environ.copy()
+            environment["IMAGE_ROLLOUT_SHIM_CODEX"] = str(
+                self.make_fake_codex(directory)
+            )
+            environment["FAKE_CODEX_EXPECT_MODEL"] = DEFAULT_MODEL
+            environment["FAKE_CODEX_READY"] = str(ready_path)
+            environment["FAKE_CODEX_SLEEP_SECONDS"] = "30"
+            environment["IMAGE_ROLLOUT_SHIM_JOB_ROOT"] = str(job_root)
+            environment["TMPDIR"] = str(private_root)
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(RUNNER),
+                    "--image",
+                    str(self.make_image(directory)),
+                    "--timeout",
+                    "30",
+                    "--job-id",
+                    job_id,
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=environment,
+            )
+            self.assertIsNotNone(process.stdin)
+            process.stdin.write(json.dumps(self.base_request()))
+            process.stdin.close()
+            process.stdin = None
+
+            deadline = time.monotonic() + 10
+            while not ready_path.is_file() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(ready_path.is_file(), "worker did not start")
+
+            status_result = self.run_job_command("status", job_id, job_root)
+            pending_result = self.run_job_command("collect", job_id, job_root)
+            premature_cleanup = self.run_job_command("cleanup", job_id, job_root)
+            status = json.loads(status_result.stdout)
+            pending = json.loads(pending_result.stdout)
+
+            self.assertEqual(status_result.returncode, 0, status_result.stdout)
+            self.assertEqual(status["state"], "running")
+            self.assertEqual(status["phase"], "worker")
+            self.assertGreaterEqual(status["worker_events_seen"], 2)
+            self.assertEqual(status["last_worker_event"], "turn_started")
+            self.assertEqual(pending_result.returncode, 3, pending_result.stdout)
+            self.assertEqual(pending["status"], "pending")
+            self.assertEqual(premature_cleanup.returncode, 2)
+            self.assertEqual(
+                json.loads(premature_cleanup.stdout)["error"]["code"],
+                "job_still_running",
+            )
+            for output in (status_result.stdout, pending_result.stdout):
+                self.assertNotIn("fixture.png", output)
+                self.assertNotIn("PRIVATE-EVENT", output)
+                self.assertNotIn("data:image", output)
+
+            process.terminate()
+            stdout, stderr = process.communicate(timeout=15)
+            self.assertEqual(stderr, "")
+            self.assertEqual(json.loads(stdout)["error"]["code"], "interrupted")
+
+            terminal_status = json.loads(
+                self.run_job_command("status", job_id, job_root).stdout
+            )
+            collected = self.run_job_command("collect", job_id, job_root)
+            self.assertEqual(terminal_status["state"], "interrupted")
+            self.assertEqual(json.loads(collected.stdout)["error"]["code"], "interrupted")
+            self.run_job_command("cleanup", job_id, job_root)
+
+    def test_job_identifier_cannot_escape_the_job_root(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            job_root = directory / "jobs"
+            result = self.run_shim(
+                self.make_image(directory),
+                self.make_fake_codex(directory),
+                self.base_request(),
+                job_id="../escape",
+                job_root=job_root,
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stdout)["error"]["code"], "invalid_job")
+
+    def test_terminal_job_state_cannot_regress_to_running(self) -> None:
+        runner = self.load_runner()
+        with tempfile.TemporaryDirectory() as name:
+            job_root = Path(name) / "jobs"
+            with mock.patch.dict(
+                os.environ,
+                {"IMAGE_ROLLOUT_SHIM_JOB_ROOT": str(job_root)},
+            ):
+                diagnostics = runner.RunDiagnostics(phase="worker")
+                controller = runner.JobController.create("terminal-run-01")
+                controller.update(diagnostics)
+                diagnostics.phase = "completed"
+                controller.finish(
+                    {"status": "ok"},
+                    diagnostics,
+                    state="succeeded",
+                )
+
+                diagnostics.phase = "worker"
+                diagnostics.worker_events_seen += 1
+                diagnostics.last_worker_event = "item_activity"
+                controller.update(diagnostics)
+                status = runner.read_job_status("terminal-run-01")
+
+        self.assertEqual(status["state"], "succeeded")
+        self.assertEqual(status["phase"], "completed")
+        self.assertEqual(status["worker_events_seen"], 0)
 
     def test_failed_worker_streams_do_not_escape(self) -> None:
         with tempfile.TemporaryDirectory() as name:
@@ -307,15 +687,9 @@ class ShimTests(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "worker_failed")
         self.assertEqual(payload["diagnostics"]["phase"], "worker")
         self.assertEqual(payload["diagnostics"]["last_worker_event"], "error")
-        self.assertFalse(payload["diagnostics"]["raw_worker_output_forwarded"])
 
     def test_complete_report_is_recovered_after_worker_timeout(self) -> None:
-        spec = importlib.util.spec_from_file_location("image_rollout_shim_runner", RUNNER)
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        runner = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = runner
-        spec.loader.exec_module(runner)
+        runner = self.load_runner()
 
         with tempfile.TemporaryDirectory() as name:
             directory = Path(name)
@@ -335,7 +709,7 @@ class ShimTests(unittest.TestCase):
             )
             request = self.base_request()
             report = {
-                "schema_version": "1.0",
+                "schema_version": "1.1",
                 "summary": "Recovered complete report.",
                 "findings": [],
                 "answers": [],
@@ -385,6 +759,7 @@ class ShimTests(unittest.TestCase):
                     "high",
                     30,
                     directory,
+                    RUNNER.with_name("report.schema.json"),
                     diagnostics,
                 )
 
@@ -426,6 +801,24 @@ class ShimTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["error"]["code"], "invalid_request")
+
+    def test_markup_like_request_text_is_allowed_without_being_echoed(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            request = self.base_request()
+            request["context"] = "Review an <img> element and ![preview](render.png)."
+            request["questions"] = ["Is the ![preview](render.png) visible?"]
+            result = self.run_shim(
+                self.make_image(directory),
+                self.make_fake_codex(directory),
+                request,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["report"]["answers"][0]["question_index"], 1)
+        self.assertNotIn("![preview]", result.stdout)
+        self.assertNotIn("<img>", result.stdout)
 
     def test_missing_pillow_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as name:

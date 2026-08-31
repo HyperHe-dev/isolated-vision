@@ -2,31 +2,94 @@
 
 ## Boundary
 
-The parent model may know image paths, labels, textual task context, the final report, and fixed non-image diagnostics. It must not receive an image content item, data URL, encoded image bytes, Markdown image, or raw child-process stream. The launcher consumes the worker's JSONL stdout privately, retains only whitelisted event categories and aggregate timings, and discards every raw event payload plus stderr.
+The parent may know source paths, labels, task context, the final text report, and
+fixed non-image diagnostics. It must not receive image content, Data URLs, encoded
+bytes, Markdown images, or raw child-process streams. The launcher keeps only
+whitelisted event categories and aggregate timings; raw JSONL payloads and stderr
+are discarded.
 
-The routing point is immediately before any parent `view_image` call for a local path. The parent replaces that call with the launcher and supplies the visual brief derived from its current task and active domain skills. This contract cannot retroactively isolate pixels already returned by another screenshot/image tool or attached by the user.
+Routing happens immediately before a would-be parent `view_image` call. The parent
+supplies the visual brief derived from the active task and any relevant domain
+Skill. Pixels already attached to the parent or returned by another tool cannot be
+isolated retroactively.
 
-For programmatic CUA or browser calls, an inner tool result may contain screenshot data without entering the parent rollout only when the outer exec does not forward that image content. Surface text or a stable absolute local screenshot path instead. A required screenshot may then be inspected through the launcher; a tool that can only emit pixels to the parent is outside this shim's isolatable path.
+For CUA or browser automation, an outer exec may keep an inner screenshot out of
+the parent rollout only when it forwards text or a stable local path—not image
+content. Inspect that path through this launcher. Tools that can only return pixels
+to the parent are outside the shim's path.
 
-The launcher and ephemeral child process can read the source files. The child runs under the same OS account, inherits the launching process environment and normal Codex authentication/configuration, and may be able to read other files permitted by its sandbox. The child sends image inputs through the normal Codex model path. `--ephemeral` prevents local session rollout persistence; it does not create a separate OS identity or alter provider-side data policy.
+The parent may link a stable original source as a normal Markdown file link when
+the user should see it. Do not use image syntax or worker-private prepared files.
+The Codex UI may fetch or proxy the linked file for preview; that transfer is
+outside this boundary, so omit optional links for sensitive sources.
+
+The launcher and child can read the sources. The child uses the same OS account,
+environment, Codex authentication, and filesystem access allowed by its sandbox.
+Images use the normal Codex model path. `--ephemeral` prevents local child-session
+persistence; it does not create a separate identity or change provider policy.
+
+## Job control
+
+An optional opaque `--job-id` creates a text-only record in the OS temporary
+directory. `status.json` is updated atomically with fixed phase, state, timing,
+counts, safe error code, and whitelisted event categories. `result.json` is written
+before a terminal state is recorded. Files are `0600` inside a `0700` directory and
+contain no source paths, labels, prompts, raw events, stderr, or report drafts.
+
+The command runner's managed session remains the normal result path. If its handle
+is lost, `status --job-id ID` gives coarse last-known progress but does not prove
+process liveness. After a terminal state, `collect --job-id ID` returns the same
+validated envelope without rerunning the review. `cleanup --job-id ID` removes a
+terminal record and refuses a running job.
 
 ## Review modes
 
-- `standard` attaches each supported source once. Use it for ordinary images where small details are not decisive.
-- `thorough` privately normalizes orientation, creates a whole-image overview, and adds overlapping native-resolution PNG tiles when the overview would lose detail. The report must account for every attachment region.
+- `standard` attaches each supported source once.
+- `thorough` normalizes orientation, creates a whole-image overview, and adds
+  overlapping native-resolution PNG tiles when detail would otherwise be lost.
+  The report must cover every attachment region.
 
-The maximum of eight source images and 48 prepared attachments is a validation ceiling, not a performance recommendation. Batch only images that need direct comparison or shared visual reasoning. Independent groups should run sequentially so each request stays semantically focused; `thorough` attachment expansion, total source pixels, and task complexity can matter more than the source-image count alone.
+Eight sources and 48 prepared attachments are validation ceilings, not recommended
+batch sizes. Group only images that need direct comparison. Total pixels,
+attachment expansion, and task complexity can matter more than source count.
 
 ## Worker model
 
-The launcher accepts one optional `--model` value. Omitted, empty, or whitespace-only input resolves to `gpt-5.6-sol`. A non-empty value must be a single 1–128 character model identifier: it starts with an ASCII letter or digit and then contains only ASCII letters, digits, `.`, `_`, `:`, `/`, `@`, `+`, or `-`. The launcher passes the validated value as one argv element after Codex's `--model` option, so it cannot add flags or shell syntax. The successful launch metadata reports the resolved value as `effective_model`.
+Omitted or blank `--model` input resolves to `gpt-5.6-sol`. A supplied identifier
+must be 1–128 ASCII characters, start with a letter or digit, and then use only
+letters, digits, `.`, `_`, `:`, `/`, `@`, `+`, or `-`. It is passed as one argv
+element and cannot become extra child-CLI flags. Successful diagnostics expose it
+as `effective_model`.
 
 ## Report
 
-The report separates observations from recommendations. Every finding includes severity, evidence, location, and confidence. Coordinates are normalized to the original source image; `-1` means that a precise box is not defensible. Coverage lists every inspected attachment ID and any limitations.
+Findings separate observations from recommendations and include severity,
+evidence, location, and confidence. Coordinates refer to the original source;
+`-1` means a precise box is not defensible. `answers` represents every requested
+question exactly once by its 1-based `question_index`. Coverage lists every
+attachment ID exactly once and records limitations.
 
-The worker report schema is [report.schema.json](../scripts/report.schema.json). The parent-facing success/error envelope, including non-image execution metadata, is [launcher-output.schema.json](../scripts/launcher-output.schema.json). Diagnostics contain only fixed phases, elapsed times, source/attachment counts, aggregate byte and pixel counts, the selected model and reasoning effort, whitelisted worker-event categories, exit state, and final-report recovery state. They never contain paths, labels, prompts, report text, stderr, or raw JSONL events.
+The base worker schema is [report.schema.json](../scripts/report.schema.json). For
+each run, the launcher specializes it with the exact mode, counts, source indices,
+attachment IDs, and question indices; the local validator independently rechecks
+the output. The parent envelope is
+[launcher-output.schema.json](../scripts/launcher-output.schema.json).
+
+Diagnostics are limited to fixed phases, elapsed times, counts, aggregate byte and
+pixel totals, selected model and reasoning effort, whitelisted event categories,
+exit/recovery state, and an optional fixed validation-rule ID. They never include
+paths, labels, prompts, report text, stderr, or raw events.
 
 ## Fail-closed behavior
 
-The launcher returns only a safe error code and fixed diagnostics when it cannot create its private workspace, the parent sandbox prevents the nested Codex worker from running, the worker times out, exits unsuccessfully, omits output, produces invalid JSON, fails schema checks, misses attachment coverage, or emits image-like payloads. If a timeout occurs after `final-report.json` was fully written, the launcher may recover it only after ordinary output-safety, schema, and coverage validation succeeds. Partial, invalid, incomplete, or image-like timeout output still fails closed. The launcher never forwards rejected output and never asks the parent to inspect the image directly.
+Workspace or job-state errors, blocked worker launch, timeout, nonzero exit,
+missing output, invalid JSON, schema failure, incomplete coverage, and image-like
+payloads return only a safe error code and fixed diagnostics. Handled interrupts
+and ordinary timeouts terminate the worker process group and remove the private
+image workspace. `SIGKILL`, host failure, or power loss can still leave temporary
+files; job records intentionally remain until cleanup.
+
+If a timeout occurs after `final-report.json` was fully written, the launcher may
+recover it only after the normal safety, schema, and coverage checks pass. Partial
+or rejected output is never forwarded, and the parent is never told to inspect the
+image directly as a fallback.

@@ -23,7 +23,7 @@
         "worker_exit_code",
         "final_report_present",
         "report_recovered_after_timeout",
-        "raw_worker_output_forwarded"
+        "validation_rule"
       ],
       "properties": {
         "phase": {
@@ -84,7 +84,26 @@
         "worker_exit_code": {"type": ["integer", "null"]},
         "final_report_present": {"type": "boolean"},
         "report_recovered_after_timeout": {"type": "boolean"},
-        "raw_worker_output_forwarded": {"const": false}
+        "validation_rule": {
+          "type": ["string", "null"],
+          "enum": [
+            "root",
+            "schema_version",
+            "summary",
+            "findings",
+            "answers",
+            "uncertainties",
+            "coverage_shape",
+            "coverage_mode",
+            "coverage_source_count",
+            "coverage_attachment_count",
+            "coverage_regions",
+            "coverage_limitations",
+            "output_safety",
+            "output_size",
+            null
+          ]
+        }
       }
     }
   },
@@ -92,42 +111,11 @@
     {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "report", "meta"],
+      "required": ["status", "report", "diagnostics"],
       "properties": {
         "status": {"const": "ok"},
         "report": {"$ref": "report.schema.json"},
-        "meta": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "mode",
-            "source_images",
-            "private_attachments",
-            "worker_session",
-            "raw_worker_output_forwarded",
-            "effective_model",
-            "reasoning_effort",
-            "diagnostics"
-          ],
-          "properties": {
-            "mode": {"type": "string", "enum": ["standard", "thorough"]},
-            "source_images": {"type": "integer", "minimum": 1, "maximum": 8},
-            "private_attachments": {"type": "integer", "minimum": 1, "maximum": 48},
-            "worker_session": {"const": "ephemeral"},
-            "raw_worker_output_forwarded": {"const": false},
-            "effective_model": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@+\\-]{0,127}$"
-            },
-            "reasoning_effort": {
-              "type": "string",
-              "enum": ["low", "medium", "high", "xhigh", "max", "ultra"]
-            },
-            "diagnostics": {"$ref": "#/$defs/diagnostics"}
-          }
-        }
+        "diagnostics": {"$ref": "#/$defs/diagnostics"}
       }
     },
     {

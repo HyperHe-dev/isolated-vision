@@ -29,7 +29,8 @@ except ImportError:  # pragma: no cover - exercised through the CLI error path
 
 
 WORKER_MARKER = "[image-rollout-shim-worker:v1]"
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
+JOB_SCHEMA_VERSION = "1.1"
 DEFAULT_MODEL = "gpt-5.6-sol"
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_OUTPUT_BYTES = 192 * 1024
@@ -37,6 +38,7 @@ MAX_IMAGE_BYTES = 256 * 1024 * 1024
 MAX_IMAGE_PIXELS = 250_000_000
 MAX_SOURCE_IMAGES = 8
 MAX_ATTACHMENTS = 48
+MAX_JOB_STATE_BYTES = 16 * 1024
 OVERVIEW_MAX_EDGE = 2048
 TILE_OVERLAP = 128
 TILE_CANDIDATES = (1600, 2048, 2560, 3072, 4096)
@@ -50,6 +52,25 @@ ALLOWED_REQUEST_FIELDS = {
     "output_language",
 }
 REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
+RUN_PHASES = {
+    "arguments",
+    "request",
+    "sources",
+    "attachments",
+    "worker",
+    "validation",
+    "completed",
+}
+WORKER_EVENT_CATEGORIES = {
+    "thread_started",
+    "turn_started",
+    "turn_completed",
+    "turn_failed",
+    "item_activity",
+    "error",
+    "other",
+}
+JOB_STATES = {"running", "succeeded", "failed", "interrupted"}
 SAFE_ERROR_MESSAGES = {
     "invalid_request": "The textual inspection request is invalid.",
     "invalid_model": "The requested model identifier is invalid.",
@@ -68,6 +89,12 @@ SAFE_ERROR_MESSAGES = {
     "unsafe_worker_output": "The isolated visual worker returned image-like or encoded output.",
     "incomplete_worker_coverage": "The isolated visual worker did not account for every review region.",
     "interrupted": "The isolated visual inspection was interrupted.",
+    "invalid_job": "The isolated visual job identifier is invalid.",
+    "job_exists": "The isolated visual job identifier is already in use.",
+    "job_not_found": "The isolated visual job does not exist.",
+    "job_result_not_ready": "The isolated visual job has no final result yet.",
+    "job_still_running": "The isolated visual job is still running.",
+    "job_state_unavailable": "The isolated visual job state is unavailable.",
     "internal_error": "The isolation launcher encountered an internal error.",
 }
 
@@ -79,12 +106,18 @@ HTML_IMAGE_RE = re.compile(r"<\s*img\b", re.IGNORECASE)
 BASE64_RUN_RE = re.compile(r"(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_=-]{512,}(?![A-Za-z0-9+/_=-])")
 IMAGE_SIGNATURES = ("iVBORw0KGgo", "/9j/4AAQSkZJRg", "R0lGOD", "UklGR")
 BANNED_KEYS = {"image_url", "data_url", "base64", "blob", "bytes", "raw_image"}
+JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+JOB_COMMANDS = {"status", "collect", "cleanup"}
 
 
 class ShimError(Exception):
     def __init__(self, code: str):
         super().__init__(code)
         self.code = code
+
+
+class InterruptionRequested(Exception):
+    """Raised when the launcher receives an external termination signal."""
 
 
 @dataclass
@@ -107,7 +140,7 @@ class RunDiagnostics:
     worker_exit_code: int | None = None
     final_report_present: bool = False
     report_recovered_after_timeout: bool = False
-    raw_worker_output_forwarded: bool = False
+    validation_rule: str | None = None
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -129,8 +162,91 @@ class RunDiagnostics:
             "worker_exit_code": self.worker_exit_code,
             "final_report_present": self.final_report_present,
             "report_recovered_after_timeout": self.report_recovered_after_timeout,
-            "raw_worker_output_forwarded": self.raw_worker_output_forwarded,
+            "validation_rule": self.validation_rule,
         }
+
+
+@dataclass
+class JobController:
+    job_id: str
+    directory: Path
+    started_at_unix_ms: int = field(
+        default_factory=lambda: round(time.time() * 1000)
+    )
+    closed: bool = field(default=False, repr=False)
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @classmethod
+    def create(cls, job_id: str) -> "JobController":
+        validated_id = validate_job_id(job_id)
+        root = ensure_job_root()
+        directory = root / validated_id
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            raise ShimError("job_exists") from None
+        except OSError:
+            raise ShimError("job_state_unavailable") from None
+        return cls(validated_id, directory)
+
+    @property
+    def status_path(self) -> Path:
+        return self.directory / "status.json"
+
+    @property
+    def result_path(self) -> Path:
+        return self.directory / "result.json"
+
+    def update(
+        self,
+        diagnostics: RunDiagnostics,
+        *,
+        state: str = "running",
+        error_code: str | None = None,
+    ) -> None:
+        with self.lock:
+            if self.closed:
+                return
+            self._write_status(diagnostics, state, error_code)
+
+    def _write_status(
+        self,
+        diagnostics: RunDiagnostics,
+        state: str,
+        error_code: str | None,
+    ) -> None:
+        payload = {
+            "schema_version": JOB_SCHEMA_VERSION,
+            "job_id": self.job_id,
+            "state": state,
+            "phase": diagnostics.phase,
+            "started_at_unix_ms": self.started_at_unix_ms,
+            "source_images": diagnostics.source_images,
+            "private_attachments": diagnostics.private_attachments,
+            "worker_events_seen": diagnostics.worker_events_seen,
+            "last_worker_event": diagnostics.last_worker_event,
+            "error_code": error_code,
+        }
+        atomic_write_json(self.status_path, payload, MAX_JOB_STATE_BYTES)
+
+    def finish(
+        self,
+        payload: dict[str, Any],
+        diagnostics: RunDiagnostics,
+        *,
+        state: str,
+        error_code: str | None = None,
+    ) -> None:
+        with self.lock:
+            if self.closed:
+                return
+            atomic_write_json(self.result_path, payload, MAX_OUTPUT_BYTES)
+            self.closed = True
+            try:
+                self._write_status(diagnostics, state, error_code)
+            except BaseException:
+                self.closed = False
+                raise
 
 
 class SafeArgumentParser(argparse.ArgumentParser):
@@ -160,21 +276,7 @@ class WorkerResult:
     recovered_after_timeout: bool
 
 
-def parse_args() -> argparse.Namespace:
-    raw_args = sys.argv[1:]
-    model_values: list[str] = []
-    for index, argument in enumerate(raw_args):
-        if argument == "--model":
-            if index + 1 >= len(raw_args):
-                raise ShimError("invalid_model")
-            model_values.append(raw_args[index + 1])
-        elif argument.startswith("--model="):
-            model_values.append(argument.split("=", 1)[1])
-    if len(model_values) > 1:
-        raise ShimError("invalid_model")
-    if model_values:
-        effective_model(model_values[0])
-
+def parse_run_args(raw_args: list[str]) -> argparse.Namespace:
     parser = SafeArgumentParser(
         description="Run a fail-closed ephemeral Codex worker for local image inspection."
     )
@@ -203,10 +305,47 @@ def parse_args() -> argparse.Namespace:
         default=600,
         help="Worker timeout in seconds (30-1800; default: 600).",
     )
+    parser.add_argument(
+        "--job-id",
+        help=(
+            "Optional caller-chosen job identifier for safe status and result "
+            "recovery."
+        ),
+    )
     return parser.parse_args(raw_args)
 
 
-def emit_error(code: str, diagnostics: RunDiagnostics) -> int:
+def parse_job_command(command: str, raw_args: list[str]) -> argparse.Namespace:
+    parser = SafeArgumentParser(description=f"{command.title()} an isolated vision job.")
+    parser.add_argument("--job-id", required=True)
+    args = parser.parse_args(raw_args)
+    args.command = command
+    return args
+
+
+def parse_cli() -> argparse.Namespace:
+    raw_args = sys.argv[1:]
+    if raw_args and raw_args[0] in JOB_COMMANDS:
+        return parse_job_command(raw_args[0], raw_args[1:])
+    if raw_args and raw_args[0] == "run":
+        raw_args = raw_args[1:]
+    args = parse_run_args(raw_args)
+    args.command = "run"
+    return args
+
+
+def write_stdout_payload(payload: Any) -> None:
+    sys.stdout.write(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    )
+    sys.stdout.flush()
+
+
+def emit_error(
+    code: str,
+    diagnostics: RunDiagnostics,
+    controller: JobController | None = None,
+) -> int:
     safe_code = code if code in SAFE_ERROR_MESSAGES else "internal_error"
     payload = {
         "status": "error",
@@ -216,8 +355,17 @@ def emit_error(code: str, diagnostics: RunDiagnostics) -> int:
         },
         "diagnostics": diagnostics.as_payload(),
     }
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
+    if controller is not None:
+        try:
+            controller.finish(
+                payload,
+                diagnostics,
+                state="interrupted" if safe_code == "interrupted" else "failed",
+                error_code=safe_code,
+            )
+        except ShimError:
+            pass
+    write_stdout_payload(payload)
     return 2
 
 
@@ -226,6 +374,15 @@ def create_private_workspace() -> tempfile.TemporaryDirectory[str]:
         return tempfile.TemporaryDirectory(prefix="image-rollout-shim-")
     except OSError:
         raise ShimError("private_workspace_unavailable") from None
+
+
+def request_interruption(_signum: int, _frame: Any) -> None:
+    raise InterruptionRequested()
+
+
+def install_signal_handlers() -> None:
+    signal.signal(signal.SIGTERM, request_interruption)
+    signal.signal(signal.SIGINT, request_interruption)
 
 
 def effective_model(value: str | None) -> str:
@@ -254,7 +411,7 @@ def _bounded_text(value: Any, *, maximum: int, allow_empty: bool = True) -> str:
     text = value.strip()
     if (not allow_empty and not text) or len(text) > maximum:
         raise ShimError("invalid_request")
-    assert_safe_text(text, "invalid_request")
+    assert_safe_request_text(text)
     return text
 
 
@@ -310,6 +467,16 @@ def assert_safe_text(text: str, code: str = "unsafe_worker_output") -> None:
         raise ShimError(code)
 
 
+def assert_safe_request_text(text: str) -> None:
+    if (
+        DATA_URL_RE.search(text)
+        or BASE64_MARKER_RE.search(text)
+        or BASE64_RUN_RE.search(text)
+        or any(signature in text for signature in IMAGE_SIGNATURES)
+    ):
+        raise ShimError("invalid_request")
+
+
 def assert_safe_tree(value: Any) -> None:
     if isinstance(value, dict):
         for key, child in value.items():
@@ -321,6 +488,160 @@ def assert_safe_tree(value: Any) -> None:
             assert_safe_tree(child)
     elif isinstance(value, str):
         assert_safe_text(value)
+
+
+def validate_job_id(value: Any) -> str:
+    if not isinstance(value, str) or not JOB_ID_RE.fullmatch(value):
+        raise ShimError("invalid_job")
+    return value
+
+
+def job_root_path() -> Path:
+    configured = os.environ.get("IMAGE_ROLLOUT_SHIM_JOB_ROOT")
+    if configured:
+        root = Path(configured)
+        if not root.is_absolute():
+            raise ShimError("job_state_unavailable")
+        return root
+    return Path(tempfile.gettempdir()) / "image-rollout-shim-jobs"
+
+
+def ensure_job_root(*, create: bool = True) -> Path:
+    root = job_root_path()
+    try:
+        if create:
+            root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not root.exists():
+            raise ShimError("job_not_found")
+        if root.is_symlink() or not root.is_dir():
+            raise ShimError("job_state_unavailable")
+        if hasattr(os, "geteuid") and root.stat().st_uid != os.geteuid():
+            raise ShimError("job_state_unavailable")
+        if create:
+            os.chmod(root, 0o700)
+    except ShimError:
+        raise
+    except OSError:
+        raise ShimError("job_state_unavailable") from None
+    return root
+
+
+def resolve_job_directory(job_id: str) -> Path:
+    directory = ensure_job_root(create=False) / validate_job_id(job_id)
+    try:
+        if directory.is_symlink() or not directory.is_dir():
+            raise ShimError("job_not_found")
+        if hasattr(os, "geteuid") and directory.stat().st_uid != os.geteuid():
+            raise ShimError("job_state_unavailable")
+    except ShimError:
+        raise
+    except OSError:
+        raise ShimError("job_state_unavailable") from None
+    return directory
+
+
+def atomic_write_json(path: Path, payload: Any, maximum_bytes: int) -> None:
+    temporary_path: Path | None = None
+    try:
+        assert_safe_tree(payload)
+        encoded = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        if len(encoded) > maximum_bytes:
+            raise ShimError("job_state_unavailable")
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(encoded)
+        os.replace(temporary_path, path)
+        temporary_path = None
+    except ShimError:
+        raise
+    except OSError:
+        raise ShimError("job_state_unavailable") from None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+
+
+def load_safe_json(path: Path, maximum_bytes: int) -> Any:
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ShimError("job_result_not_ready")
+        size = path.stat().st_size
+        if size <= 0 or size > maximum_bytes:
+            raise ShimError("job_state_unavailable")
+        text = path.read_text(encoding="utf-8")
+        payload = json.loads(text)
+        assert_safe_tree(payload)
+        return payload
+    except ShimError as error:
+        if error.code == "job_result_not_ready":
+            raise
+        raise ShimError("job_state_unavailable") from None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ShimError("job_state_unavailable") from None
+
+
+def validate_job_status(value: Any, job_id: str) -> dict[str, Any]:
+    expected = {
+        "schema_version",
+        "job_id",
+        "state",
+        "phase",
+        "started_at_unix_ms",
+        "source_images",
+        "private_attachments",
+        "worker_events_seen",
+        "last_worker_event",
+        "error_code",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ShimError("job_state_unavailable")
+    if value["schema_version"] != JOB_SCHEMA_VERSION or value["job_id"] != job_id:
+        raise ShimError("job_state_unavailable")
+    if value["state"] not in JOB_STATES:
+        raise ShimError("job_state_unavailable")
+    if value["phase"] not in RUN_PHASES:
+        raise ShimError("job_state_unavailable")
+    for key in (
+        "started_at_unix_ms",
+        "source_images",
+        "private_attachments",
+        "worker_events_seen",
+    ):
+        if isinstance(value[key], bool) or not isinstance(value[key], int) or value[key] < 0:
+            raise ShimError("job_state_unavailable")
+    if value["last_worker_event"] is not None and (
+        value["last_worker_event"] not in WORKER_EVENT_CATEGORIES
+    ):
+        raise ShimError("job_state_unavailable")
+    if value["error_code"] is not None and value["error_code"] not in SAFE_ERROR_MESSAGES:
+        raise ShimError("job_state_unavailable")
+    return value
+
+
+def read_job_status(job_id: str) -> dict[str, Any]:
+    directory = resolve_job_directory(job_id)
+    status = validate_job_status(
+        load_safe_json(directory / "status.json", MAX_JOB_STATE_BYTES), job_id
+    )
+    now = round(time.time() * 1000)
+    result = {
+        key: value
+        for key, value in status.items()
+        if key != "started_at_unix_ms"
+    }
+    result["elapsed_ms"] = max(0, now - status["started_at_unix_ms"])
+    return result
 
 
 def inspect_sources(paths: list[str], labels: list[str]) -> list[SourceImage]:
@@ -500,12 +821,72 @@ Inspection protocol:
 - Address the objective, focus list, and every question. Separate direct observation from inference.
 - Localize findings against the original source image. Coordinates are normalized from 0 to 1; use -1 for x, y, width, and height when a precise box is not defensible.
 - Use concise visual evidence, calibrated confidence, and explicit limitations. Do not invent hidden state or implementation details.
+- answers must cover every REQUEST_JSON question exactly once using its 1-based question_index. Do not repeat the question text. Return an empty answers array when there are no questions.
 - coverage.reviewed_regions must contain every manifest id exactly once, even when a region has no finding.
 - Write all human-readable report text in the requested output language.
 
 REQUEST_JSON={json.dumps(request_for_worker, ensure_ascii=False, separators=(",", ":"))}
 ATTACHMENT_MANIFEST_JSON={json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))}
 """
+
+
+def write_runtime_report_schema(
+    request: dict[str, Any],
+    sources: list[SourceImage],
+    attachments: list[Attachment],
+    private_dir: Path,
+) -> Path:
+    base_path = Path(__file__).with_name("report.schema.json").resolve()
+    try:
+        schema = json.loads(base_path.read_text(encoding="utf-8"))
+        properties = schema["properties"]
+        location_properties = properties["findings"]["items"]["properties"][
+            "location"
+        ]["properties"]
+        coverage_properties = properties["coverage"]["properties"]
+        answers_schema = properties["answers"]
+
+        location_properties["image_index"] = {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": len(sources),
+        }
+        coverage_properties["mode"] = {
+            "type": "string",
+            "enum": [request["mode"]],
+        }
+        coverage_properties["source_images"] = {
+            "type": "integer",
+            "enum": [len(sources)],
+        }
+        coverage_properties["attachments"] = {
+            "type": "integer",
+            "enum": [len(attachments)],
+        }
+        region_ids = [attachment.manifest["id"] for attachment in attachments]
+        coverage_properties["reviewed_regions"] = {
+            "type": "array",
+            "minItems": len(region_ids),
+            "maxItems": len(region_ids),
+            "items": {"type": "string", "enum": region_ids},
+        }
+        questions = request["questions"]
+        answers_schema["minItems"] = len(questions)
+        answers_schema["maxItems"] = len(questions)
+        if questions:
+            answers_schema["items"]["properties"]["question_index"] = {
+                "type": "integer",
+                "enum": list(range(1, len(questions) + 1)),
+            }
+
+        runtime_path = private_dir / "runtime-report.schema.json"
+        runtime_path.write_text(
+            json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+        raise ShimError("internal_error") from None
+    return runtime_path
 
 
 def classify_worker_event(value: Any) -> str | None:
@@ -522,7 +903,11 @@ def classify_worker_event(value: Any) -> str | None:
     }.get(value, "other")
 
 
-def consume_worker_events(stream: Any, diagnostics: RunDiagnostics) -> None:
+def consume_worker_events(
+    stream: Any,
+    diagnostics: RunDiagnostics,
+    controller: JobController | None = None,
+) -> None:
     try:
         for raw_line in stream:
             try:
@@ -536,6 +921,11 @@ def consume_worker_events(stream: Any, diagnostics: RunDiagnostics) -> None:
                 continue
             diagnostics.worker_events_seen += 1
             diagnostics.last_worker_event = event_name
+            if controller is not None:
+                try:
+                    controller.update(diagnostics)
+                except ShimError:
+                    pass
     finally:
         try:
             stream.close()
@@ -557,7 +947,6 @@ def load_worker_report(output_path: Path) -> Any:
     try:
         raw_output = output_path.read_bytes()
         text_output = raw_output.decode("utf-8")
-        assert_safe_text(text_output)
         report = json.loads(text_output)
     except ShimError:
         raise
@@ -567,6 +956,25 @@ def load_worker_report(output_path: Path) -> Any:
     return report
 
 
+def terminate_worker_process(process: subprocess.Popen[bytes], grace_seconds: int = 5) -> None:
+    if process.returncode is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
 def run_worker(
     prompt: str,
     attachments: list[Attachment],
@@ -574,14 +982,15 @@ def run_worker(
     reasoning_effort: str,
     timeout: int,
     private_dir: Path,
+    schema_path: Path,
     diagnostics: RunDiagnostics,
+    controller: JobController | None = None,
 ) -> WorkerResult:
     configured_binary = os.environ.get("IMAGE_ROLLOUT_SHIM_CODEX", "codex")
     codex_binary = shutil.which(configured_binary)
     if codex_binary is None:
         raise ShimError("codex_not_found")
 
-    schema_path = Path(__file__).with_name("report.schema.json").resolve()
     if not schema_path.is_file():
         raise ShimError("internal_error")
     output_path = private_dir / "final-report.json"
@@ -630,7 +1039,7 @@ def run_worker(
         raise ShimError("internal_error")
     event_thread = threading.Thread(
         target=consume_worker_events,
-        args=(process.stdout, diagnostics),
+        args=(process.stdout, diagnostics, controller),
         name="image-rollout-shim-events",
         daemon=True,
     )
@@ -654,6 +1063,12 @@ def run_worker(
         except ProcessLookupError:
             pass
         process.wait()
+    except (InterruptionRequested, KeyboardInterrupt):
+        terminate_worker_process(process)
+        raise
+    except Exception:
+        terminate_worker_process(process)
+        raise
     finally:
         event_thread.join(timeout=5)
 
@@ -712,85 +1127,197 @@ def validate_report(
     request: dict[str, Any],
     sources: list[SourceImage],
     attachments: list[Attachment],
+    diagnostics: RunDiagnostics | None = None,
 ) -> dict[str, Any]:
-    root = expect_exact_keys(
-        report,
-        {"schema_version", "summary", "findings", "answers", "uncertainties", "coverage"},
-    )
-    if root["schema_version"] != SCHEMA_VERSION:
-        raise ShimError("invalid_worker_output")
-    expect_text(root["summary"], 8000)
-
-    severities = {"critical", "major", "minor", "observation"}
-    for finding in expect_array(root["findings"], 100):
-        item = expect_exact_keys(
-            finding,
+    rule = "root"
+    try:
+        root = expect_exact_keys(
+            report,
             {
-                "severity",
-                "category",
-                "title",
-                "observation",
-                "evidence",
-                "location",
-                "confidence",
-                "recommendation",
+                "schema_version",
+                "summary",
+                "findings",
+                "answers",
+                "uncertainties",
+                "coverage",
             },
         )
-        if item["severity"] not in severities:
+        rule = "schema_version"
+        if root["schema_version"] != SCHEMA_VERSION:
             raise ShimError("invalid_worker_output")
-        expect_text(item["category"], 200)
-        expect_text(item["title"], 500)
-        expect_text(item["observation"], 4000)
-        expect_text(item["evidence"], 4000)
-        expect_text(item["recommendation"], 4000)
-        expect_number(item["confidence"], 0, 1)
-        location = expect_exact_keys(
-            item["location"], {"image_index", "description", "x", "y", "width", "height"}
+        rule = "summary"
+        expect_text(root["summary"], 8000)
+
+        rule = "findings"
+        severities = {"critical", "major", "minor", "observation"}
+        for finding in expect_array(root["findings"], 100):
+            item = expect_exact_keys(
+                finding,
+                {
+                    "severity",
+                    "category",
+                    "title",
+                    "observation",
+                    "evidence",
+                    "location",
+                    "confidence",
+                    "recommendation",
+                },
+            )
+            if item["severity"] not in severities:
+                raise ShimError("invalid_worker_output")
+            expect_text(item["category"], 200)
+            expect_text(item["title"], 500)
+            expect_text(item["observation"], 4000)
+            expect_text(item["evidence"], 4000)
+            expect_text(item["recommendation"], 4000)
+            expect_number(item["confidence"], 0, 1)
+            location = expect_exact_keys(
+                item["location"],
+                {"image_index", "description", "x", "y", "width", "height"},
+            )
+            expect_integer(location["image_index"], 1, len(sources))
+            expect_text(location["description"], 500)
+            for coordinate in ("x", "y", "width", "height"):
+                expect_number(location[coordinate], -1, 1)
+
+        rule = "answers"
+        answered_questions: list[int] = []
+        for answer in expect_array(root["answers"], 32):
+            item = expect_exact_keys(
+                answer, {"question_index", "answer", "confidence"}
+            )
+            answered_questions.append(
+                expect_integer(item["question_index"], 1, len(request["questions"]))
+            )
+            expect_text(item["answer"], 5000)
+            expect_number(item["confidence"], 0, 1)
+        if (
+            len(answered_questions) != len(set(answered_questions))
+            or set(answered_questions) != set(range(1, len(request["questions"]) + 1))
+        ):
+            raise ShimError("invalid_worker_output")
+
+        rule = "uncertainties"
+        for uncertainty in expect_array(root["uncertainties"], 32):
+            expect_text(uncertainty, 1000)
+
+        rule = "coverage_shape"
+        coverage = expect_exact_keys(
+            root["coverage"],
+            {"mode", "source_images", "attachments", "reviewed_regions", "limitations"},
         )
-        expect_integer(location["image_index"], 1, len(sources))
-        expect_text(location["description"], 500)
-        for coordinate in ("x", "y", "width", "height"):
-            expect_number(location[coordinate], -1, 1)
+        rule = "coverage_mode"
+        if coverage["mode"] != request["mode"]:
+            raise ShimError("invalid_worker_output")
+        rule = "coverage_source_count"
+        if expect_integer(coverage["source_images"], 1, MAX_SOURCE_IMAGES) != len(sources):
+            raise ShimError("invalid_worker_output")
+        rule = "coverage_attachment_count"
+        if expect_integer(coverage["attachments"], 1, MAX_ATTACHMENTS) != len(attachments):
+            raise ShimError("invalid_worker_output")
+        rule = "coverage_regions"
+        reviewed = expect_array(coverage["reviewed_regions"], MAX_ATTACHMENTS)
+        for region_id in reviewed:
+            expect_text(region_id, 100)
+        expected_regions = [attachment.manifest["id"] for attachment in attachments]
+        if len(reviewed) != len(set(reviewed)) or set(reviewed) != set(expected_regions):
+            raise ShimError("incomplete_worker_coverage")
+        rule = "coverage_limitations"
+        for limitation in expect_array(coverage["limitations"], 32):
+            expect_text(limitation, 1000)
 
-    for answer in expect_array(root["answers"], 32):
-        item = expect_exact_keys(answer, {"question", "answer", "confidence"})
-        expect_text(item["question"], 1000)
-        expect_text(item["answer"], 5000)
-        expect_number(item["confidence"], 0, 1)
+        rule = "output_safety"
+        assert_safe_tree(root)
+        rule = "output_size"
+        encoded = json.dumps(root, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        if len(encoded) > MAX_OUTPUT_BYTES:
+            raise ShimError("unsafe_worker_output")
+        return root
+    except ShimError:
+        if diagnostics is not None:
+            diagnostics.validation_rule = rule
+        raise
 
-    for uncertainty in expect_array(root["uncertainties"], 32):
-        expect_text(uncertainty, 1000)
 
-    coverage = expect_exact_keys(
-        root["coverage"],
-        {"mode", "source_images", "attachments", "reviewed_regions", "limitations"},
+def set_phase(
+    diagnostics: RunDiagnostics,
+    controller: JobController | None,
+    phase: str,
+) -> None:
+    diagnostics.phase = phase
+    if controller is not None:
+        controller.update(diagnostics)
+
+
+def emit_job_command_error(code: str) -> int:
+    safe_code = code if code in SAFE_ERROR_MESSAGES else "internal_error"
+    write_stdout_payload(
+        {
+            "status": "error",
+            "error": {
+                "code": safe_code,
+                "message": SAFE_ERROR_MESSAGES[safe_code],
+            },
+        }
     )
-    if coverage["mode"] != request["mode"]:
-        raise ShimError("invalid_worker_output")
-    if expect_integer(coverage["source_images"], 1, MAX_SOURCE_IMAGES) != len(sources):
-        raise ShimError("invalid_worker_output")
-    if expect_integer(coverage["attachments"], 1, MAX_ATTACHMENTS) != len(attachments):
-        raise ShimError("invalid_worker_output")
-    reviewed = expect_array(coverage["reviewed_regions"], MAX_ATTACHMENTS)
-    for region_id in reviewed:
-        expect_text(region_id, 100)
-    expected_regions = [attachment.manifest["id"] for attachment in attachments]
-    if len(reviewed) != len(set(reviewed)) or set(reviewed) != set(expected_regions):
-        raise ShimError("incomplete_worker_coverage")
-    for limitation in expect_array(coverage["limitations"], 32):
-        expect_text(limitation, 1000)
+    return 2
 
-    assert_safe_tree(root)
-    encoded = json.dumps(root, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    if len(encoded) > MAX_OUTPUT_BYTES:
-        raise ShimError("unsafe_worker_output")
-    return root
+
+def handle_job_command(args: argparse.Namespace) -> int:
+    try:
+        job_id = validate_job_id(args.job_id)
+        if args.command == "status":
+            write_stdout_payload({"status": "ok", **read_job_status(job_id)})
+            return 0
+
+        directory = resolve_job_directory(job_id)
+        status = read_job_status(job_id)
+        if args.command == "collect":
+            if status["state"] == "running":
+                write_stdout_payload(
+                    {
+                        "status": "pending",
+                        "job": status,
+                    }
+                )
+                return 3
+            result = load_safe_json(directory / "result.json", MAX_OUTPUT_BYTES)
+            if not isinstance(result, dict) or result.get("status") not in {"ok", "error"}:
+                raise ShimError("job_state_unavailable")
+            write_stdout_payload(result)
+            return 0 if result.get("status") == "ok" else 2
+
+        if args.command == "cleanup":
+            if status["state"] == "running":
+                raise ShimError("job_still_running")
+            try:
+                shutil.rmtree(directory)
+            except OSError:
+                raise ShimError("job_state_unavailable") from None
+            write_stdout_payload(
+                {"status": "ok", "job_id": job_id, "removed": True}
+            )
+            return 0
+
+        raise ShimError("invalid_request")
+    except ShimError as error:
+        return emit_job_command_error(error.code)
 
 
 def main() -> int:
     diagnostics = RunDiagnostics()
+    controller: JobController | None = None
     try:
-        args = parse_args()
+        install_signal_handlers()
+        args = parse_cli()
+        if args.command != "run":
+            return handle_job_command(args)
+        if args.job_id is not None:
+            controller = JobController.create(args.job_id)
+            controller.update(diagnostics)
         if not 30 <= args.timeout <= 1800:
             raise ShimError("invalid_request")
         diagnostics.timeout_seconds = args.timeout
@@ -798,10 +1325,10 @@ def main() -> int:
         model = effective_model(args.model)
         diagnostics.effective_model = model
 
-        diagnostics.phase = "request"
+        set_phase(diagnostics, controller, "request")
         request = read_request()
 
-        diagnostics.phase = "sources"
+        set_phase(diagnostics, controller, "sources")
         stage_started = time.monotonic()
         try:
             sources = inspect_sources(args.image, request["image_labels"])
@@ -813,7 +1340,7 @@ def main() -> int:
         diagnostics.source_bytes = sum(source.byte_size for source in sources)
         diagnostics.source_pixels = sum(source.width * source.height for source in sources)
 
-        diagnostics.phase = "attachments"
+        set_phase(diagnostics, controller, "attachments")
         with create_private_workspace() as private_name:
             private_dir = Path(private_name)
             stage_started = time.monotonic()
@@ -825,8 +1352,11 @@ def main() -> int:
                 )
             diagnostics.private_attachments = len(attachments)
             prompt = build_worker_prompt(request, attachments)
+            schema_path = write_runtime_report_schema(
+                request, sources, attachments, private_dir
+            )
 
-            diagnostics.phase = "worker"
+            set_phase(diagnostics, controller, "worker")
             stage_started = time.monotonic()
             try:
                 worker_result = run_worker(
@@ -836,18 +1366,20 @@ def main() -> int:
                     args.reasoning_effort,
                     args.timeout,
                     private_dir,
+                    schema_path,
                     diagnostics,
+                    controller,
                 )
             finally:
                 diagnostics.worker_ms = max(
                     0, round((time.monotonic() - stage_started) * 1000)
                 )
 
-            diagnostics.phase = "validation"
+            set_phase(diagnostics, controller, "validation")
             stage_started = time.monotonic()
             try:
                 validated = validate_report(
-                    worker_result.report, request, sources, attachments
+                    worker_result.report, request, sources, attachments, diagnostics
                 )
             finally:
                 diagnostics.validation_ms = max(
@@ -856,34 +1388,27 @@ def main() -> int:
             diagnostics.report_recovered_after_timeout = (
                 worker_result.recovered_after_timeout
             )
-            diagnostics.phase = "completed"
+            set_phase(diagnostics, controller, "completed")
             payload = {
                 "status": "ok",
                 "report": validated,
-                "meta": {
-                    "mode": request["mode"],
-                    "source_images": len(sources),
-                    "private_attachments": len(attachments),
-                    "worker_session": "ephemeral",
-                    "raw_worker_output_forwarded": False,
-                    "effective_model": model,
-                    "reasoning_effort": args.reasoning_effort,
-                    "diagnostics": diagnostics.as_payload(),
-                },
+                "diagnostics": diagnostics.as_payload(),
             }
             output = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-            assert_safe_text(output)
             if len(output.encode("utf-8")) > MAX_OUTPUT_BYTES:
                 raise ShimError("unsafe_worker_output")
-            sys.stdout.write(output + "\n")
-            sys.stdout.flush()
+            if controller is not None:
+                controller.finish(payload, diagnostics, state="succeeded")
+            write_stdout_payload(payload)
             return 0
     except ShimError as error:
-        return emit_error(error.code, diagnostics)
+        return emit_error(error.code, diagnostics, controller)
+    except InterruptionRequested:
+        return emit_error("interrupted", diagnostics, controller)
     except KeyboardInterrupt:
-        return emit_error("interrupted", diagnostics)
+        return emit_error("interrupted", diagnostics, controller)
     except Exception:
-        return emit_error("internal_error", diagnostics)
+        return emit_error("internal_error", diagnostics, controller)
 
 
 if __name__ == "__main__":
