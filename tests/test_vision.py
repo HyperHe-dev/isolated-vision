@@ -133,10 +133,121 @@ class VisionTests(unittest.TestCase):
         return path
 
     def make_fake_codex(self, directory: Path) -> Path:
-        path = directory / "fake-codex"
-        path.write_text(textwrap.dedent(FAKE_CODEX), encoding="utf-8")
-        path.chmod(0o755)
-        return path
+        script_path = directory / (
+            "fake-codex.py" if os.name == "nt" else "fake-codex"
+        )
+        script_path.write_text(textwrap.dedent(FAKE_CODEX), encoding="utf-8")
+        if os.name != "nt":
+            script_path.chmod(0o755)
+            return script_path
+
+        wrapper_path = directory / "fake-codex.cmd"
+        wrapper_path.write_text(
+            "@echo off\n"
+            "set PYTHONUTF8=1\n"
+            f'"{sys.executable}" "%~dp0fake-codex.py" %*\n',
+            encoding="utf-8",
+        )
+        return wrapper_path
+
+    def process_is_alive(self, process_id: int) -> bool:
+        if os.name != "nt":
+            try:
+                os.kill(process_id, 0)
+            except ProcessLookupError:
+                return False
+            stat_path = Path(f"/proc/{process_id}/stat")
+            if stat_path.is_file():
+                try:
+                    if stat_path.read_text(encoding="utf-8").split()[2] == "Z":
+                        return False
+                except (OSError, IndexError):
+                    pass
+            return True
+
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        wait_for_single_object = kernel32.WaitForSingleObject
+        wait_for_single_object.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        wait_for_single_object.restype = wintypes.DWORD
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+        handle = open_process(0x00100000, False, process_id)  # SYNCHRONIZE
+        if not handle:
+            return False
+        try:
+            return wait_for_single_object(handle, 0) == 258  # WAIT_TIMEOUT
+        finally:
+            close_handle(handle)
+
+    def windows_acl_sddl(self, path: Path) -> str:
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        security_descriptor = wintypes.LPVOID()
+        dacl = wintypes.LPVOID()
+        get_named_security = advapi32.GetNamedSecurityInfoW
+        get_named_security.argtypes = [
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+        ]
+        get_named_security.restype = wintypes.DWORD
+        error = get_named_security(
+            str(path),
+            1,
+            0x00000004,
+            None,
+            None,
+            ctypes.byref(dacl),
+            None,
+            ctypes.byref(security_descriptor),
+        )
+        self.assertEqual(error, 0)
+
+        sddl = wintypes.LPWSTR()
+        length = wintypes.ULONG()
+        convert = advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW
+        convert.argtypes = [
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPWSTR),
+            ctypes.POINTER(wintypes.ULONG),
+        ]
+        convert.restype = wintypes.BOOL
+        local_free = kernel32.LocalFree
+        local_free.argtypes = [wintypes.LPVOID]
+        local_free.restype = wintypes.LPVOID
+        try:
+            self.assertTrue(
+                convert(
+                    security_descriptor,
+                    1,
+                    0x00000004,
+                    ctypes.byref(sddl),
+                    ctypes.byref(length),
+                )
+            )
+            return sddl.value
+        finally:
+            if sddl:
+                local_free(sddl)
+            if security_descriptor:
+                local_free(security_descriptor)
 
     def run_vision(
         self,
@@ -465,7 +576,7 @@ class VisionTests(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "invalid_worker_output")
         self.assertEqual(payload["diagnostics"]["validation_rule"], "answers")
 
-    def test_sigterm_stops_worker_and_removes_private_workspace(self) -> None:
+    def test_launcher_termination_stops_worker_tree(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             directory = Path(name)
             private_root = directory / "private-root"
@@ -494,6 +605,9 @@ class VisionTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True,
                 env=environment,
+                creationflags=(
+                    subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+                ),
             )
             self.assertIsNotNone(process.stdin)
             process.stdin.write(json.dumps(self.base_request()))
@@ -505,25 +619,73 @@ class VisionTests(unittest.TestCase):
                 time.sleep(0.05)
             self.assertTrue(ready_path.is_file(), "worker did not start")
             worker_pid = int(ready_path.read_text(encoding="utf-8"))
+            if os.name == "nt":
+                workspaces = list(private_root.glob("isolated-vision-*"))
+                self.assertEqual(len(workspaces), 1)
+                runner = self.load_runner()
+                self.assertIn(
+                    runner.windows_current_user_sid(),
+                    self.windows_acl_sddl(workspaces[0]),
+                )
 
             process.terminate()
             stdout, stderr = process.communicate(timeout=15)
-            payload = json.loads(stdout)
-            self.assertEqual(process.returncode, 2)
-            self.assertEqual(stderr, "")
-            self.assertEqual(payload["error"]["code"], "interrupted")
-            self.assertEqual(list(private_root.glob("isolated-vision-*")), [])
+            if os.name != "nt":
+                payload = json.loads(stdout)
+                self.assertEqual(process.returncode, 2)
+                self.assertEqual(stderr, "")
+                self.assertEqual(payload["error"]["code"], "interrupted")
+                self.assertEqual(list(private_root.glob("isolated-vision-*")), [])
+            else:
+                self.assertNotEqual(process.returncode, 0)
 
             deadline = time.monotonic() + 5
-            worker_alive = True
+            worker_alive = self.process_is_alive(worker_pid)
             while worker_alive and time.monotonic() < deadline:
-                try:
-                    os.kill(worker_pid, 0)
-                except ProcessLookupError:
-                    worker_alive = False
-                else:
-                    time.sleep(0.05)
+                time.sleep(0.05)
+                worker_alive = self.process_is_alive(worker_pid)
             self.assertFalse(worker_alive, "worker survived launcher termination")
+
+    def test_worker_process_tree_termination_is_cross_platform(self) -> None:
+        runner = self.load_runner()
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            child_pid_path = directory / "child.pid"
+            tree_script = directory / "process-tree.py"
+            tree_script.write_text(
+                "import subprocess, sys, time\n"
+                "from pathlib import Path\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                "Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            options = (
+                {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                if os.name == "nt"
+                else {"start_new_session": True}
+            )
+            process = subprocess.Popen(
+                [sys.executable, str(tree_script), str(child_pid_path)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **options,
+            )
+            deadline = time.monotonic() + 10
+            while not child_pid_path.is_file() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(child_pid_path.is_file(), "child process did not start")
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+
+            runner.terminate_worker_process(process, grace_seconds=0)
+
+            deadline = time.monotonic() + 5
+            child_alive = self.process_is_alive(child_pid)
+            while child_alive and time.monotonic() < deadline:
+                time.sleep(0.05)
+                child_alive = self.process_is_alive(child_pid)
+            self.assertFalse(child_alive, "child survived process-tree termination")
 
     def test_job_result_can_be_collected_after_the_run_session_is_gone(self) -> None:
         with tempfile.TemporaryDirectory() as name:
@@ -541,15 +703,30 @@ class VisionTests(unittest.TestCase):
             collect_result = self.run_job_command("collect", job_id, job_root)
 
             job_directory = job_root / job_id
-            self.assertEqual(oct(job_directory.stat().st_mode & 0o777), "0o700")
-            self.assertEqual(
-                oct((job_directory / "status.json").stat().st_mode & 0o777),
-                "0o600",
-            )
-            self.assertEqual(
-                oct((job_directory / "result.json").stat().st_mode & 0o777),
-                "0o600",
-            )
+            if os.name != "nt":
+                self.assertEqual(oct(job_directory.stat().st_mode & 0o777), "0o700")
+                self.assertEqual(
+                    oct((job_directory / "status.json").stat().st_mode & 0o777),
+                    "0o600",
+                )
+                self.assertEqual(
+                    oct((job_directory / "result.json").stat().st_mode & 0o777),
+                    "0o600",
+                )
+            else:
+                runner = self.load_runner()
+                sddl = self.windows_acl_sddl(job_directory)
+                self.assertIn("D:P", sddl)
+                user_sid = runner.windows_current_user_sid()
+                self.assertIn(user_sid, sddl)
+                self.assertIn(
+                    user_sid,
+                    self.windows_acl_sddl(job_directory / "status.json"),
+                )
+                self.assertIn(
+                    user_sid,
+                    self.windows_acl_sddl(job_directory / "result.json"),
+                )
 
             cleanup_result = self.run_job_command("cleanup", job_id, job_root)
             self.assertFalse(job_directory.exists())
@@ -603,6 +780,9 @@ class VisionTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True,
                 env=environment,
+                creationflags=(
+                    subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+                ),
             )
             self.assertIsNotNone(process.stdin)
             process.stdin.write(json.dumps(self.base_request()))
@@ -613,6 +793,7 @@ class VisionTests(unittest.TestCase):
             while not ready_path.is_file() and time.monotonic() < deadline:
                 time.sleep(0.05)
             self.assertTrue(ready_path.is_file(), "worker did not start")
+            worker_pid = int(ready_path.read_text(encoding="utf-8"))
 
             status_result = self.run_job_command("status", job_id, job_root)
             pending_result = self.run_job_command("collect", job_id, job_root)
@@ -639,16 +820,30 @@ class VisionTests(unittest.TestCase):
 
             process.terminate()
             stdout, stderr = process.communicate(timeout=15)
-            self.assertEqual(stderr, "")
-            self.assertEqual(json.loads(stdout)["error"]["code"], "interrupted")
+            if os.name != "nt":
+                self.assertEqual(stderr, "")
+                self.assertEqual(json.loads(stdout)["error"]["code"], "interrupted")
 
-            terminal_status = json.loads(
-                self.run_job_command("status", job_id, job_root).stdout
-            )
-            collected = self.run_job_command("collect", job_id, job_root)
-            self.assertEqual(terminal_status["state"], "interrupted")
-            self.assertEqual(json.loads(collected.stdout)["error"]["code"], "interrupted")
-            self.run_job_command("cleanup", job_id, job_root)
+                terminal_status = json.loads(
+                    self.run_job_command("status", job_id, job_root).stdout
+                )
+                collected = self.run_job_command("collect", job_id, job_root)
+                self.assertEqual(terminal_status["state"], "interrupted")
+                self.assertEqual(
+                    json.loads(collected.stdout)["error"]["code"], "interrupted"
+                )
+                self.run_job_command("cleanup", job_id, job_root)
+            else:
+                deadline = time.monotonic() + 5
+                worker_alive = self.process_is_alive(worker_pid)
+                while worker_alive and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                    worker_alive = self.process_is_alive(worker_pid)
+                self.assertFalse(worker_alive, "worker survived launcher termination")
+                terminal_status = json.loads(
+                    self.run_job_command("status", job_id, job_root).stdout
+                )
+                self.assertEqual(terminal_status["state"], "running")
 
     def test_job_identifier_cannot_escape_the_job_root(self) -> None:
         with tempfile.TemporaryDirectory() as name:
@@ -825,10 +1020,30 @@ class VisionTests(unittest.TestCase):
                 effective_model=DEFAULT_MODEL,
                 reasoning_effort="high",
             )
+
+            def terminate_fake(process: TimedOutProcess) -> None:
+                process.wait()
+
+            class FakeWindowsJob:
+                def assign(self, _process: TimedOutProcess) -> None:
+                    pass
+
+                def close(self) -> None:
+                    pass
+
             with (
                 mock.patch.object(runner.shutil, "which", return_value="/fake/codex"),
                 mock.patch.object(runner.subprocess, "Popen", TimedOutProcess),
-                mock.patch.object(runner.os, "killpg"),
+                mock.patch.object(
+                    runner.WindowsKillOnCloseJob,
+                    "create",
+                    return_value=FakeWindowsJob(),
+                ),
+                mock.patch.object(
+                    runner,
+                    "force_terminate_worker_process",
+                    side_effect=terminate_fake,
+                ),
             ):
                 result = runner.run_worker(
                     "worker prompt",

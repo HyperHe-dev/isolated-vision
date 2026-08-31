@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -108,6 +110,9 @@ IMAGE_SIGNATURES = ("iVBORw0KGgo", "/9j/4AAQSkZJRg", "R0lGOD", "UklGR")
 BANNED_KEYS = {"image_url", "data_url", "base64", "blob", "bytes", "raw_image"}
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 JOB_COMMANDS = {"status", "collect", "cleanup"}
+IS_WINDOWS = os.name == "nt"
+WINDOWS_SID_RE = re.compile(r"^S-\d+(?:-\d+)+$")
+_WINDOWS_USER_SID: str | None = None
 
 
 class VisionError(Exception):
@@ -187,6 +192,14 @@ class JobController:
             raise VisionError("job_exists") from None
         except OSError:
             raise VisionError("job_state_unavailable") from None
+        try:
+            protect_private_directory(directory, "job_state_unavailable")
+        except VisionError:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+            raise
         return cls(validated_id, directory)
 
     @property
@@ -274,6 +287,236 @@ class Attachment:
 class WorkerResult:
     report: Any
     recovered_after_timeout: bool
+
+
+def path_is_link_like(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    if IS_WINDOWS:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        if attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+            return True
+    is_junction = getattr(path, "is_junction", None)
+    return bool(callable(is_junction) and is_junction())
+
+
+def windows_current_user_sid() -> str:
+    global _WINDOWS_USER_SID
+    if _WINDOWS_USER_SID is not None:
+        return _WINDOWS_USER_SID
+    try:
+        result = subprocess.run(
+            ["whoami", "/user", "/fo", "csv", "/nh"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise OSError("unable to resolve the current Windows user SID") from None
+    if result.returncode != 0:
+        raise OSError("unable to resolve the current Windows user SID")
+    try:
+        rows = list(csv.reader(result.stdout.splitlines()))
+    except csv.Error:
+        raise OSError("unable to parse the current Windows user SID") from None
+    for row in rows:
+        if len(row) >= 2:
+            sid = row[1].strip()
+            if WINDOWS_SID_RE.fullmatch(sid):
+                _WINDOWS_USER_SID = sid
+                return sid
+    raise OSError("unable to resolve the current Windows user SID")
+
+
+def protect_windows_directory(path: Path) -> None:
+    """Replace a directory DACL with user, SYSTEM, and Administrators access."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    user_sid = windows_current_user_sid()
+    descriptor = wintypes.LPVOID()
+    descriptor_size = wintypes.ULONG()
+    dacl_present = wintypes.BOOL()
+    dacl_defaulted = wintypes.BOOL()
+    dacl = wintypes.LPVOID()
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    convert.restype = wintypes.BOOL
+    get_dacl = advapi32.GetSecurityDescriptorDacl
+    get_dacl.argtypes = [
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    get_dacl.restype = wintypes.BOOL
+    set_named_security = advapi32.SetNamedSecurityInfoW
+    set_named_security.argtypes = [
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+    ]
+    set_named_security.restype = wintypes.DWORD
+    local_free = kernel32.LocalFree
+    local_free.argtypes = [wintypes.LPVOID]
+    local_free.restype = wintypes.LPVOID
+
+    sddl = (
+        f"D:P(A;OICI;FA;;;{user_sid})"
+        "(A;OICI;FA;;;SY)"
+        "(A;OICI;FA;;;BA)"
+    )
+    if not convert(sddl, 1, ctypes.byref(descriptor), ctypes.byref(descriptor_size)):
+        raise OSError(ctypes.get_last_error(), "unable to create a private DACL")
+    try:
+        if not get_dacl(
+            descriptor,
+            ctypes.byref(dacl_present),
+            ctypes.byref(dacl),
+            ctypes.byref(dacl_defaulted),
+        ) or not dacl_present.value:
+            raise OSError(ctypes.get_last_error(), "unable to read the private DACL")
+        error = set_named_security(
+            str(path),
+            1,  # SE_FILE_OBJECT
+            0x00000004 | 0x80000000,  # DACL + PROTECTED_DACL
+            None,
+            None,
+            dacl,
+            None,
+        )
+        if error:
+            raise OSError(error, "unable to apply the private DACL")
+    finally:
+        local_free(descriptor)
+
+
+def protect_private_directory(path: Path, error_code: str) -> None:
+    try:
+        if IS_WINDOWS:
+            protect_windows_directory(path)
+        else:
+            os.chmod(path, 0o700)
+    except OSError:
+        raise VisionError(error_code) from None
+
+
+class WindowsKillOnCloseJob:
+    def __init__(self, handle: int):
+        self.handle = handle
+
+    @classmethod
+    def create(cls) -> "WindowsKillOnCloseJob":
+        import ctypes
+        from ctypes import wintypes
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimitInformation),
+                ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_job = kernel32.CreateJobObjectW
+        create_job.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        create_job.restype = wintypes.HANDLE
+        set_information = kernel32.SetInformationJobObject
+        set_information.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        set_information.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = create_job(None, None)
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "unable to create a worker job")
+        information = ExtendedLimitInformation()
+        information.BasicLimitInformation.LimitFlags = 0x00002000
+        if not set_information(
+            handle,
+            9,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            error = ctypes.get_last_error()
+            close_handle(handle)
+            raise OSError(error, "unable to configure a worker job")
+        return cls(handle)
+
+    def assign(self, process: subprocess.Popen[bytes]) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        assign_process = kernel32.AssignProcessToJobObject
+        assign_process.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        assign_process.restype = wintypes.BOOL
+        if not assign_process(self.handle, wintypes.HANDLE(process._handle)):
+            raise OSError(ctypes.get_last_error(), "unable to assign the worker job")
+
+    def close(self) -> None:
+        if not self.handle:
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+        close_handle(self.handle)
+        self.handle = 0
 
 
 def parse_run_args(raw_args: list[str]) -> argparse.Namespace:
@@ -375,9 +618,20 @@ def emit_error(
 
 
 def create_private_workspace() -> tempfile.TemporaryDirectory[str]:
+    workspace: tempfile.TemporaryDirectory[str] | None = None
     try:
-        return tempfile.TemporaryDirectory(prefix="isolated-vision-")
+        workspace = tempfile.TemporaryDirectory(prefix="isolated-vision-")
+        protect_private_directory(
+            Path(workspace.name), "private_workspace_unavailable"
+        )
+        return workspace
+    except VisionError:
+        if workspace is not None:
+            workspace.cleanup()
+        raise
     except OSError:
+        if workspace is not None:
+            workspace.cleanup()
         raise VisionError("private_workspace_unavailable") from None
 
 
@@ -388,6 +642,8 @@ def request_interruption(_signum: int, _frame: Any) -> None:
 def install_signal_handlers() -> None:
     signal.signal(signal.SIGTERM, request_interruption)
     signal.signal(signal.SIGINT, request_interruption)
+    if IS_WINDOWS and hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, request_interruption)
 
 
 def effective_model(value: str | None) -> str:
@@ -514,12 +770,12 @@ def ensure_job_root(*, create: bool = True) -> Path:
             root.mkdir(mode=0o700, parents=True, exist_ok=True)
         if not root.exists():
             raise VisionError("job_not_found")
-        if root.is_symlink() or not root.is_dir():
+        if path_is_link_like(root) or not root.is_dir():
             raise VisionError("job_state_unavailable")
         if hasattr(os, "geteuid") and root.stat().st_uid != os.geteuid():
             raise VisionError("job_state_unavailable")
         if create:
-            os.chmod(root, 0o700)
+            protect_private_directory(root, "job_state_unavailable")
     except VisionError:
         raise
     except OSError:
@@ -530,10 +786,12 @@ def ensure_job_root(*, create: bool = True) -> Path:
 def resolve_job_directory(job_id: str) -> Path:
     directory = ensure_job_root(create=False) / validate_job_id(job_id)
     try:
-        if directory.is_symlink() or not directory.is_dir():
+        if path_is_link_like(directory) or not directory.is_dir():
             raise VisionError("job_not_found")
         if hasattr(os, "geteuid") and directory.stat().st_uid != os.geteuid():
             raise VisionError("job_state_unavailable")
+        if IS_WINDOWS:
+            protect_private_directory(directory, "job_state_unavailable")
     except VisionError:
         raise
     except OSError:
@@ -557,7 +815,8 @@ def atomic_write_json(path: Path, payload: Any, maximum_bytes: int) -> None:
             delete=False,
         ) as handle:
             temporary_path = Path(handle.name)
-            os.fchmod(handle.fileno(), 0o600)
+            if not IS_WINDOWS:
+                os.fchmod(handle.fileno(), 0o600)
             handle.write(encoded)
         os.replace(temporary_path, path)
         temporary_path = None
@@ -575,7 +834,7 @@ def atomic_write_json(path: Path, payload: Any, maximum_bytes: int) -> None:
 
 def load_safe_json(path: Path, maximum_bytes: int) -> Any:
     try:
-        if path.is_symlink() or not path.is_file():
+        if path_is_link_like(path) or not path.is_file():
             raise VisionError("job_result_not_ready")
         size = path.stat().st_size
         if size <= 0 or size > maximum_bytes:
@@ -957,23 +1216,65 @@ def load_worker_report(output_path: Path) -> Any:
     return report
 
 
+def force_terminate_worker_process(
+    process: subprocess.Popen[bytes], wait_seconds: int = 5
+) -> None:
+    if process.returncode is not None:
+        return
+    if IS_WINDOWS:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=wait_seconds,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError):
+            try:
+                process.kill()
+            except OSError:
+                pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=wait_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        process.wait()
+
+
 def terminate_worker_process(process: subprocess.Popen[bytes], grace_seconds: int = 5) -> None:
     if process.returncode is not None:
         return
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
+        if IS_WINDOWS:
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+    except (AttributeError, OSError, ProcessLookupError, ValueError):
+        force_terminate_worker_process(process)
+        return
     try:
         process.wait(timeout=grace_seconds)
-        return
     except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
+        force_terminate_worker_process(process)
+
+
+def worker_process_group_options() -> dict[str, Any]:
+    if IS_WINDOWS:
+        return {
+            "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        }
+    return {"start_new_session": True}
 
 
 def run_worker(
@@ -1034,9 +1335,22 @@ def run_worker(
         stderr=subprocess.DEVNULL,
         cwd=work_dir,
         env=environment,
-        start_new_session=True,
+        **worker_process_group_options(),
     )
+    worker_job: WindowsKillOnCloseJob | None = None
+    if IS_WINDOWS:
+        try:
+            worker_job = WindowsKillOnCloseJob.create()
+            worker_job.assign(process)
+        except OSError:
+            if worker_job is not None:
+                worker_job.close()
+            force_terminate_worker_process(process)
+            raise VisionError("worker_failed") from None
     if process.stdin is None or process.stdout is None:
+        if worker_job is not None:
+            worker_job.close()
+        force_terminate_worker_process(process)
         raise VisionError("internal_error")
     event_thread = threading.Thread(
         target=consume_worker_events,
@@ -1059,11 +1373,7 @@ def run_worker(
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
+        force_terminate_worker_process(process)
     except (InterruptionRequested, KeyboardInterrupt):
         terminate_worker_process(process)
         raise
@@ -1072,6 +1382,8 @@ def run_worker(
         raise
     finally:
         event_thread.join(timeout=5)
+        if worker_job is not None:
+            worker_job.close()
 
     diagnostics.worker_exit_code = process.returncode
     diagnostics.final_report_present = output_path.is_file()

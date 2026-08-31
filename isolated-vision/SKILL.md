@@ -9,9 +9,9 @@ This is an interim isolated visual path. An ephemeral Codex exec worker views
 local images, and the parent task continues from validated text observations.
 See [references/contract.md](references/contract.md) for the trust boundary.
 
-It requires Python 3.10 or newer with Pillow, an authenticated `codex` CLI on
-`PATH`, private temporary-directory access, and service access for the nested
-Codex process.
+It supports Windows, macOS, and Linux. It requires Python 3.10 or newer with
+Pillow, an authenticated `codex` CLI on `PATH`, private temporary-directory
+access, and service access for the nested Codex process.
 
 ## Parent flow
 
@@ -28,17 +28,19 @@ Use this flow unless the prompt contains `[isolated-vision-worker:v1]`.
   determine visible state; context explains the current purpose and hypotheses.
   Attention priorities guide the worker while the complete visual field remains
   in scope.
-- Resolve `scripts/vision.py` relative to this file. Start the task with the
-  explicit `run` subcommand, pass the request JSON on stdin, and provide one
-  `--image` per source.
+- Resolve `scripts/vision.py` relative to this file and invoke it with an
+  available Python 3.10+ interpreter (`python` on Windows, commonly `python3`
+  on macOS or Linux). Start the task with the explicit `run` subcommand, pass
+  the request JSON on stdin, and provide one `--image` per source.
 - Image preparation is automatic. Add `--original-only` only when the task
   intentionally needs each directly supported original attached once.
 - Give each run a fresh random opaque `--job-id`. Keep the command runner's
   managed foreground session until it returns, with the `run` command's stdout
-  redirected to `/dev/null`. Retrieve the parent-facing envelope once with
-  `collect --job-id ID`, then remove the terminal record with
-  `cleanup --job-id ID`. Read the contract only when progress or recovery
-  details are needed.
+  redirected to the operating system's null sink (`$null` in PowerShell or
+  `/dev/null` in a POSIX shell). Retrieve the parent-facing envelope once with
+  `collect --job-id ID`, then remove the terminal record with `cleanup --job-id
+  ID` using the same interpreter. Read the contract only when progress or
+  recovery details are needed.
 - Pass a user-selected worker model with `--model`, or omit it to use
   `gpt-5.6-sol`.
 - Keep the parent-side exchange to paths, text, and safe diagnostics. Continue

@@ -46,8 +46,9 @@ the visual task.
 
 ## Install
 
-Requirements: macOS or Linux, Python 3.10+, Pillow, and an authenticated `codex`
-CLI on `PATH`. The nested process must be able to reach the Codex service.
+Requirements: Windows, macOS, or Linux; Python 3.10+; Pillow; and an
+authenticated `codex` CLI on `PATH`. The nested process must be able to reach
+the Codex service. Native Windows is supported; WSL is not required.
 
 Ask Codex to install the Skill directory from this repository:
 
@@ -55,16 +56,31 @@ Ask Codex to install the Skill directory from this repository:
 Use $skill-installer to install the isolated-vision directory from this repository.
 ```
 
-Then install Pillow into the same `python3` environment Codex uses:
+Then install Pillow into the same Python environment Codex uses:
 
 ```bash
-python3 -m pip install -r /absolute/path/to/checkout/isolated-vision/requirements.txt
+python -m pip install -r /absolute/path/to/checkout/isolated-vision/requirements.txt
+```
+
+Use `python3` instead when that is the Python 3.10+ interpreter name on macOS
+or Linux.
+
+On Windows PowerShell, the path can use normal Windows syntax:
+
+```powershell
+python -m pip install -r C:\path\to\checkout\isolated-vision\requirements.txt
 ```
 
 ## Use
 
 ```text
 Use $isolated-vision to view /absolute/path/to/screenshot.png and return the visual information relevant to the current task.
+```
+
+Windows paths work directly as well:
+
+```text
+Use $isolated-vision to view C:\absolute\path\to\screenshot.png and return the visual information relevant to the current task.
 ```
 
 Image preparation is automatic. Use `--original-only` when each directly
@@ -97,16 +113,32 @@ temporary files remain inside the isolated path.
 See the [isolation contract](isolated-vision/references/contract.md) for the
 full protocol and [SECURITY.md](SECURITY.md) for trust boundaries.
 
+## Windows behavior
+
+- The launcher accepts Unicode drive-letter and UNC absolute paths through
+  Python's native path handling.
+- Private workspaces and job records use a protected Windows DACL. The worker
+  runs in a kill-on-close Job Object, and timeout cleanup terminates its process
+  tree with Windows-native controls.
+- If `codex` is not discoverable on `PATH`, set `ISOLATED_VISION_CODEX` to the
+  absolute path of `codex.exe` or `codex.cmd`.
+- PowerShell uses `$null` where POSIX shell examples use `/dev/null`.
+- `Ctrl+C`/`Ctrl+Break` allows handled cleanup. An abrupt `TerminateProcess`,
+  host crash, or power loss can leave a private workspace or a job record in the
+  `running` state, although the Windows Job Object still terminates the worker
+  tree. Remove that stale state manually after confirming no run remains.
+
 ## Development
 
 ```bash
-python3 -m pip install -r isolated-vision/requirements.txt
-python3 -m unittest discover -s tests -p 'test_*.py' -v
-python3 -m py_compile isolated-vision/scripts/vision.py
+python -m pip install -r isolated-vision/requirements.txt
+python -m unittest discover -s tests -p 'test_*.py' -v
+python -m py_compile isolated-vision/scripts/vision.py
 ```
 
 Unit tests use a fake Codex executable and do not upload fixtures. GitHub Actions
-does not run live visual workers.
+tests Python 3.10 and 3.13 on both Ubuntu and Windows and does not run live
+visual workers.
 
 ## License
 

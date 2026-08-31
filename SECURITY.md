@@ -19,7 +19,11 @@ through the Skill before any image-bearing tool call:
 - handled timeouts and interrupts terminate the worker process group and remove
   the private image workspace;
 - optional job records contain only coarse status and the validated result. Files
-  are `0600` inside a `0700` text-only directory.
+  are `0600` inside a `0700` text-only directory on POSIX systems. On Windows,
+  job and private-workspace directories have a protected DACL for the current
+  account, SYSTEM, and local Administrators, which child files inherit;
+- on Windows, the worker is assigned to a kill-on-close Job Object so an abrupt
+  launcher exit terminates its process tree.
 
 A report recovered after timeout must pass the same safety, schema, and coverage
 checks as an ordinary result.
@@ -40,8 +44,9 @@ checks as an ordinary result.
   so keep it current and sandbox hostile inputs separately.
 - Text reports can be incomplete or wrong. Recoverable job records persist until
   cleanup and may contain sensitive conclusions.
-- `SIGKILL`, host crashes, or power loss may leave temporary workspaces or job
-  records behind.
+- `SIGKILL`, Windows `TerminateProcess`, host crashes, or power loss may leave
+  temporary workspaces or job records behind. An abrupt Windows exit still
+  terminates the assigned worker tree, but cannot run Python directory cleanup.
 
 Do not use this project as the sole control for secrets, regulated data, hostile
 files, or environments where the child must not read other local data.
