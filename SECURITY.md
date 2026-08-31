@@ -1,6 +1,6 @@
 # Security model
 
-Image Rollout Shim reduces one kind of parent-rollout exposure. It is not a
+Isolated Vision reduces one kind of parent-rollout exposure. It is not a
 general security boundary.
 
 ## Protected path
@@ -11,8 +11,8 @@ through the Skill before any image-bearing tool call:
 - an ephemeral child receives the image through `codex exec --image`;
 - the launcher consumes child stdout privately and discards raw JSONL payloads
   and stderr;
-- a run-specific schema fixes the expected mode, source indices, attachment IDs,
-  and counts;
+- a run-specific schema fixes the expected source indices, attachment IDs,
+  question indices, and counts;
 - only a validated JSON report and fixed diagnostics reach the parent;
 - Data URLs, base64-like data, image signatures and keys, Markdown images, HTML
   image tags, malformed reports, and incomplete coverage fail closed;
@@ -33,7 +33,7 @@ checks as an ordinary result.
   filesystem access allowed by its sandbox.
 - Images still travel through the normal Codex model path. `--ephemeral` changes
   local session persistence, not service-side data policy.
-- A normal link to a reviewed source may be fetched or proxied by the Codex UI.
+- A normal link to a source may be fetched or proxied by the Codex UI.
   That UI-side transfer is outside this boundary; omit such links for sensitive
   material.
 - Worker instructions are not an OS control. Pillow decodes source files locally,

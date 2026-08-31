@@ -1,0 +1,6 @@
+interface:
+  display_name: "Isolated Vision"
+  short_description: "Route local image viewing through an isolated exec"
+  default_prompt: "Use $isolated-vision as the isolated visual path for local images in this task."
+policy:
+  allow_implicit_invocation: true

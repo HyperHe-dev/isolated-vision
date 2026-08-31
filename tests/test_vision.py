@@ -17,8 +17,8 @@ from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNNER = ROOT / "image-rollout-shim" / "scripts" / "run_isolated_vision.py"
-LAUNCHER_SCHEMA = RUNNER.with_name("launcher-output.schema.json")
+RUNNER = ROOT / "isolated-vision" / "scripts" / "vision.py"
+ENVELOPE_SCHEMA = RUNNER.with_name("envelope.schema.json")
 DEFAULT_MODEL = "gpt-5.6-sol"
 
 
@@ -50,7 +50,7 @@ if schema_capture_path:
     Path(schema_capture_path).write_text(schema_path.read_text(encoding="utf-8"), encoding="utf-8")
 
 prompt = sys.stdin.read()
-if "[image-rollout-shim-worker:v1]" not in prompt:
+if "[isolated-vision-worker:v1]" not in prompt:
     raise SystemExit(93)
 
 print(json.dumps({"type": "thread.started", "thread_id": "private-worker"}), flush=True)
@@ -77,9 +77,9 @@ if os.environ.get("FAKE_CODEX_FAIL") == "1":
     raise SystemExit(37)
 summary = "data:image/png;base64,LEAK-MUST-NOT-ESCAPE" if unsafe else "Inspection completed."
 report = {
-    "schema_version": "1.1",
+    "schema_version": "1.2",
     "summary": summary,
-    "findings": [],
+    "observations": [],
     "answers": [
         {
             "question_index": (
@@ -94,7 +94,6 @@ report = {
     ],
     "uncertainties": [],
     "coverage": {
-        "mode": request["mode"],
         "source_images": source_count,
         "attachments": len(manifest) + (
             1 if os.environ.get("FAKE_CODEX_BAD_ATTACHMENT_COUNT") == "1" else 0
@@ -116,10 +115,10 @@ print("iVBORw0KGgoRAW-STDERR-MUST-NOT-ESCAPE", file=sys.stderr)
 '''
 
 
-class ShimTests(unittest.TestCase):
+class VisionTests(unittest.TestCase):
     def load_runner(self) -> object:
         spec = importlib.util.spec_from_file_location(
-            "image_rollout_shim_runner", RUNNER
+            "isolated_vision_runner", RUNNER
         )
         self.assertIsNotNone(spec)
         self.assertIsNotNone(spec.loader)
@@ -139,7 +138,7 @@ class ShimTests(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def run_shim(
+    def run_vision(
         self,
         image: Path,
         fake_codex: Path,
@@ -156,9 +155,10 @@ class ShimTests(unittest.TestCase):
         bad_question: bool = False,
         job_id: str | None = None,
         job_root: Path | None = None,
+        original_only: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
-        environment["IMAGE_ROLLOUT_SHIM_CODEX"] = str(fake_codex)
+        environment["ISOLATED_VISION_CODEX"] = str(fake_codex)
         if unsafe:
             environment["FAKE_CODEX_UNSAFE"] = "1"
         if fail:
@@ -176,10 +176,11 @@ class ShimTests(unittest.TestCase):
         if bad_question:
             environment["FAKE_CODEX_BAD_QUESTION"] = "1"
         if job_root is not None:
-            environment["IMAGE_ROLLOUT_SHIM_JOB_ROOT"] = str(job_root)
+            environment["ISOLATED_VISION_JOB_ROOT"] = str(job_root)
         command = [
             sys.executable,
             str(RUNNER),
+            "run",
             "--image",
             str(image),
             "--timeout",
@@ -189,6 +190,8 @@ class ShimTests(unittest.TestCase):
             command.extend(["--model", model])
         if job_id is not None:
             command.extend(["--job-id", job_id])
+        if original_only:
+            command.append("--original-only")
         return subprocess.run(
             command,
             input=json.dumps(request),
@@ -206,7 +209,7 @@ class ShimTests(unittest.TestCase):
         job_root: Path,
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
-        environment["IMAGE_ROLLOUT_SHIM_JOB_ROOT"] = str(job_root)
+        environment["ISOLATED_VISION_JOB_ROOT"] = str(job_root)
         return subprocess.run(
             [
                 sys.executable,
@@ -222,20 +225,19 @@ class ShimTests(unittest.TestCase):
             check=False,
         )
 
-    def base_request(self, mode: str = "thorough") -> dict[str, object]:
+    def base_request(self) -> dict[str, object]:
         return {
             "objective": "Inspect the synthetic image.",
             "context": "Unit-test fixture.",
             "focus": ["coverage"],
             "questions": [],
-            "mode": mode,
             "output_language": "English",
         }
 
     def test_raw_worker_streams_are_private(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             directory = Path(name)
-            result = self.run_shim(
+            result = self.run_vision(
                 self.make_image(directory),
                 self.make_fake_codex(directory),
                 self.base_request(),
@@ -249,8 +251,8 @@ class ShimTests(unittest.TestCase):
         self.assertEqual(set(payload), {"status", "report", "diagnostics"})
         diagnostics = payload["diagnostics"]
         self.assertEqual(diagnostics["effective_model"], DEFAULT_MODEL)
-        launcher_schema = json.loads(LAUNCHER_SCHEMA.read_text(encoding="utf-8"))
-        required_diagnostics = launcher_schema["$defs"]["diagnostics"]["required"]
+        envelope_schema = json.loads(ENVELOPE_SCHEMA.read_text(encoding="utf-8"))
+        required_diagnostics = envelope_schema["$defs"]["diagnostics"]["required"]
         self.assertEqual(set(diagnostics), set(required_diagnostics))
         self.assertEqual(diagnostics["phase"], "completed")
         self.assertEqual(diagnostics["last_worker_event"], "turn_completed")
@@ -260,7 +262,7 @@ class ShimTests(unittest.TestCase):
     def test_default_model_is_passed_to_worker(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             directory = Path(name)
-            result = self.run_shim(
+            result = self.run_vision(
                 self.make_image(directory),
                 self.make_fake_codex(directory),
                 self.base_request(),
@@ -273,7 +275,7 @@ class ShimTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as name:
             directory = Path(name)
             model = "provider/future-model:v2"
-            result = self.run_shim(
+            result = self.run_vision(
                 self.make_image(directory),
                 self.make_fake_codex(directory),
                 self.base_request(),
@@ -288,7 +290,7 @@ class ShimTests(unittest.TestCase):
         for model in ("", "   "):
             with self.subTest(model=repr(model)), tempfile.TemporaryDirectory() as name:
                 directory = Path(name)
-                result = self.run_shim(
+                result = self.run_vision(
                     self.make_image(directory),
                     self.make_fake_codex(directory),
                     self.base_request(),
@@ -311,7 +313,7 @@ class ShimTests(unittest.TestCase):
         for model in invalid_models:
             with self.subTest(model=model), tempfile.TemporaryDirectory() as name:
                 directory = Path(name)
-                result = self.run_shim(
+                result = self.run_vision(
                     self.make_image(directory),
                     self.make_fake_codex(directory),
                     self.base_request(),
@@ -328,7 +330,7 @@ class ShimTests(unittest.TestCase):
             directory = Path(name)
             capture = directory / "args.json"
             model = "vendor/model@2026-08-30"
-            result = self.run_shim(
+            result = self.run_vision(
                 self.make_image(directory),
                 self.make_fake_codex(directory),
                 self.base_request(),
@@ -344,7 +346,7 @@ class ShimTests(unittest.TestCase):
     def test_image_like_final_output_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             directory = Path(name)
-            result = self.run_shim(
+            result = self.run_vision(
                 self.make_image(directory),
                 self.make_fake_codex(directory),
                 self.base_request(),
@@ -356,10 +358,10 @@ class ShimTests(unittest.TestCase):
         self.assertEqual(payload["status"], "error")
         self.assertEqual(payload["error"]["code"], "unsafe_worker_output")
 
-    def test_thorough_mode_privately_tiles_large_images(self) -> None:
+    def test_automatic_preparation_privately_tiles_large_images(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             directory = Path(name)
-            result = self.run_shim(
+            result = self.run_vision(
                 self.make_image(directory, (3500, 2200)),
                 self.make_fake_codex(directory),
                 self.base_request(),
@@ -372,13 +374,31 @@ class ShimTests(unittest.TestCase):
             len(payload["report"]["coverage"]["reviewed_regions"]),
         )
 
+    def test_original_only_attaches_large_source_once(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            result = self.run_vision(
+                self.make_image(directory, (3500, 2200)),
+                self.make_fake_codex(directory),
+                self.base_request(),
+                original_only=True,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["diagnostics"]["private_attachments"], 1)
+        self.assertEqual(
+            payload["report"]["coverage"]["reviewed_regions"],
+            ["image-1-original"],
+        )
+
     def test_runtime_schema_binds_run_specific_counts_and_indices(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             directory = Path(name)
             schema_capture = directory / "runtime-schema.json"
             request = self.base_request()
             request["questions"] = ["Is the fixture visually complete?"]
-            result = self.run_shim(
+            result = self.run_vision(
                 self.make_image(directory, (3500, 2200)),
                 self.make_fake_codex(directory),
                 request,
@@ -390,14 +410,13 @@ class ShimTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         attachment_count = payload["diagnostics"]["private_attachments"]
         properties = schema["properties"]
-        image_index = properties["findings"]["items"]["properties"]["location"][
+        image_index = properties["observations"]["items"]["properties"]["location"][
             "properties"
         ]["image_index"]
         coverage = properties["coverage"]["properties"]
         reviewed = coverage["reviewed_regions"]
         answers = properties["answers"]
         self.assertEqual(image_index["maximum"], 1)
-        self.assertEqual(coverage["mode"]["enum"], ["thorough"])
         self.assertEqual(coverage["source_images"]["enum"], [1])
         self.assertEqual(coverage["attachments"]["enum"], [attachment_count])
         self.assertEqual(reviewed["minItems"], attachment_count)
@@ -413,7 +432,7 @@ class ShimTests(unittest.TestCase):
     def test_invalid_report_identifies_safe_validation_rule(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             directory = Path(name)
-            result = self.run_shim(
+            result = self.run_vision(
                 self.make_image(directory),
                 self.make_fake_codex(directory),
                 self.base_request(),
@@ -434,7 +453,7 @@ class ShimTests(unittest.TestCase):
             directory = Path(name)
             request = self.base_request()
             request["questions"] = ["Is the fixture visually complete?"]
-            result = self.run_shim(
+            result = self.run_vision(
                 self.make_image(directory),
                 self.make_fake_codex(directory),
                 request,
@@ -453,7 +472,7 @@ class ShimTests(unittest.TestCase):
             private_root.mkdir()
             ready_path = directory / "worker.pid"
             environment = os.environ.copy()
-            environment["IMAGE_ROLLOUT_SHIM_CODEX"] = str(
+            environment["ISOLATED_VISION_CODEX"] = str(
                 self.make_fake_codex(directory)
             )
             environment["FAKE_CODEX_EXPECT_MODEL"] = DEFAULT_MODEL
@@ -464,6 +483,7 @@ class ShimTests(unittest.TestCase):
                 [
                     sys.executable,
                     str(RUNNER),
+                    "run",
                     "--image",
                     str(self.make_image(directory, (3500, 2200))),
                     "--timeout",
@@ -492,7 +512,7 @@ class ShimTests(unittest.TestCase):
             self.assertEqual(process.returncode, 2)
             self.assertEqual(stderr, "")
             self.assertEqual(payload["error"]["code"], "interrupted")
-            self.assertEqual(list(private_root.glob("image-rollout-shim-*")), [])
+            self.assertEqual(list(private_root.glob("isolated-vision-*")), [])
 
             deadline = time.monotonic() + 5
             worker_alive = True
@@ -510,7 +530,7 @@ class ShimTests(unittest.TestCase):
             directory = Path(name)
             job_root = directory / "jobs"
             job_id = "recoverable-run-01"
-            result = self.run_shim(
+            result = self.run_vision(
                 self.make_image(directory),
                 self.make_fake_codex(directory),
                 self.base_request(),
@@ -558,18 +578,19 @@ class ShimTests(unittest.TestCase):
             job_id = "live-run-01"
             ready_path = directory / "worker.pid"
             environment = os.environ.copy()
-            environment["IMAGE_ROLLOUT_SHIM_CODEX"] = str(
+            environment["ISOLATED_VISION_CODEX"] = str(
                 self.make_fake_codex(directory)
             )
             environment["FAKE_CODEX_EXPECT_MODEL"] = DEFAULT_MODEL
             environment["FAKE_CODEX_READY"] = str(ready_path)
             environment["FAKE_CODEX_SLEEP_SECONDS"] = "30"
-            environment["IMAGE_ROLLOUT_SHIM_JOB_ROOT"] = str(job_root)
+            environment["ISOLATED_VISION_JOB_ROOT"] = str(job_root)
             environment["TMPDIR"] = str(private_root)
             process = subprocess.Popen(
                 [
                     sys.executable,
                     str(RUNNER),
+                    "run",
                     "--image",
                     str(self.make_image(directory)),
                     "--timeout",
@@ -633,7 +654,7 @@ class ShimTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as name:
             directory = Path(name)
             job_root = directory / "jobs"
-            result = self.run_shim(
+            result = self.run_vision(
                 self.make_image(directory),
                 self.make_fake_codex(directory),
                 self.base_request(),
@@ -649,7 +670,7 @@ class ShimTests(unittest.TestCase):
             job_root = Path(name) / "jobs"
             with mock.patch.dict(
                 os.environ,
-                {"IMAGE_ROLLOUT_SHIM_JOB_ROOT": str(job_root)},
+                {"ISOLATED_VISION_JOB_ROOT": str(job_root)},
             ):
                 diagnostics = runner.RunDiagnostics(phase="worker")
                 controller = runner.JobController.create("terminal-run-01")
@@ -674,7 +695,7 @@ class ShimTests(unittest.TestCase):
     def test_failed_worker_streams_do_not_escape(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             directory = Path(name)
-            result = self.run_shim(
+            result = self.run_vision(
                 self.make_image(directory),
                 self.make_fake_codex(directory),
                 self.base_request(),
@@ -687,6 +708,64 @@ class ShimTests(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "worker_failed")
         self.assertEqual(payload["diagnostics"]["phase"], "worker")
         self.assertEqual(payload["diagnostics"]["last_worker_event"], "error")
+
+    def test_localized_observations_are_validated(self) -> None:
+        runner = self.load_runner()
+        image_path = Path("/nonexistent/fixture.png")
+        source = runner.SourceImage(image_path, 96, 64, "PNG", "Fixture", 100)
+        attachment = runner.Attachment(
+            image_path,
+            {
+                "id": "image-1-overview",
+                "attachment_index": 1,
+                "source_image": 1,
+                "label": "Fixture",
+                "kind": "overview",
+                "original_size": [96, 64],
+                "region_pixels": [0, 0, 96, 64],
+            },
+        )
+        request = self.base_request()
+        report = {
+            "schema_version": "1.2",
+            "summary": "One localized observation.",
+            "observations": [
+                {
+                    "title": "Blue rectangle",
+                    "detail": "A uniform blue field fills the frame.",
+                    "location": {
+                        "image_index": 1,
+                        "description": "Whole image",
+                        "x": 0,
+                        "y": 0,
+                        "width": 1,
+                        "height": 1,
+                    },
+                    "confidence": 0.95,
+                }
+            ],
+            "answers": [],
+            "uncertainties": [],
+            "coverage": {
+                "source_images": 1,
+                "attachments": 1,
+                "reviewed_regions": ["image-1-overview"],
+                "limitations": [],
+            },
+        }
+
+        validated = runner.validate_report(report, request, [source], [attachment])
+        self.assertEqual(validated["observations"][0]["title"], "Blue rectangle")
+
+        judgemental = json.loads(json.dumps(report))
+        judgemental["observations"][0]["severity"] = "critical"
+        diagnostics = runner.RunDiagnostics()
+        with self.assertRaises(runner.VisionError) as raised:
+            runner.validate_report(
+                judgemental, request, [source], [attachment], diagnostics
+            )
+        self.assertEqual(raised.exception.code, "invalid_worker_output")
+        self.assertEqual(diagnostics.validation_rule, "observations")
 
     def test_complete_report_is_recovered_after_worker_timeout(self) -> None:
         runner = self.load_runner()
@@ -709,13 +788,12 @@ class ShimTests(unittest.TestCase):
             )
             request = self.base_request()
             report = {
-                "schema_version": "1.1",
+                "schema_version": "1.2",
                 "summary": "Recovered complete report.",
-                "findings": [],
+                "observations": [],
                 "answers": [],
                 "uncertainties": [],
                 "coverage": {
-                    "mode": "thorough",
                     "source_images": 1,
                     "attachments": 1,
                     "reviewed_regions": ["image-1-overview"],
@@ -778,7 +856,7 @@ class ShimTests(unittest.TestCase):
     def test_incomplete_region_coverage_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             directory = Path(name)
-            result = self.run_shim(
+            result = self.run_vision(
                 self.make_image(directory, (3500, 2200)),
                 self.make_fake_codex(directory),
                 self.base_request(),
@@ -793,7 +871,7 @@ class ShimTests(unittest.TestCase):
             directory = Path(name)
             request = self.base_request()
             request["context"] = "data:image/png;base64,AAAA"
-            result = self.run_shim(
+            result = self.run_vision(
                 self.make_image(directory),
                 self.make_fake_codex(directory),
                 request,
@@ -808,7 +886,7 @@ class ShimTests(unittest.TestCase):
             request = self.base_request()
             request["context"] = "Review an <img> element and ![preview](render.png)."
             request["questions"] = ["Is the ![preview](render.png) visible?"]
-            result = self.run_shim(
+            result = self.run_vision(
                 self.make_image(directory),
                 self.make_fake_codex(directory),
                 request,
@@ -829,6 +907,7 @@ class ShimTests(unittest.TestCase):
                     sys.executable,
                     "-S",
                     str(RUNNER),
+                    "run",
                     "--image",
                     str(image),
                     "--timeout",
