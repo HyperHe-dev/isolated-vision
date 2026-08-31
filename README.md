@@ -74,8 +74,9 @@ route that path through `$isolated-vision` and continue from the returned text
 observations. Keep parent-side image routing path-based.
 ```
 
-When useful, the parent may give the user a normal file link to a stable original
-source. It must not embed image syntax or expose worker-private temporary files.
+When useful, the parent may show a stable original source during processing with
+a Markdown image link. The Codex UI renders the preview while worker-private
+temporary files remain inside the isolated path.
 
 ## Scope
 

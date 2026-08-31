@@ -21,6 +21,8 @@ Use this flow unless the prompt contains `[isolated-vision-worker:v1]`.
   Skill needs visual information from absolute local image paths.
 - Pass the image or comparison set naturally needed by the task. Single images,
   repeated views, and multi-image comparisons are all normal.
+- When a source helps the user follow the work, show its stable absolute path
+  as a Markdown image in a commentary update while visual processing runs.
 - Provide a concise objective, relevant context, optional attention priorities,
   optional questions, useful image labels, and the output language. Images
   determine visible state; context explains the current purpose and hypotheses.
@@ -32,9 +34,11 @@ Use this flow unless the prompt contains `[isolated-vision-worker:v1]`.
 - Image preparation is automatic. Add `--original-only` only when the task
   intentionally needs each directly supported original attached once.
 - Give each run a fresh random opaque `--job-id`. Keep the command runner's
-  managed foreground session until it returns, then clean up the terminal job
-  record after consuming the result. Read the contract only when progress or
-  recovery details are needed.
+  managed foreground session until it returns, with the `run` command's stdout
+  redirected to `/dev/null`. Retrieve the parent-facing envelope once with
+  `collect --job-id ID`, then remove the terminal record with
+  `cleanup --job-id ID`. Read the contract only when progress or recovery
+  details are needed.
 - Pass a user-selected worker model with `--model`, or omit it to use
   `gpt-5.6-sol`.
 - Keep the parent-side exchange to paths, text, and safe diagnostics. Continue

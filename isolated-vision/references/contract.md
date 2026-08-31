@@ -11,9 +11,9 @@ to the parent or returned inline by another tool are already part of the parent
 context. Browser and CUA screenshots join this path when an outer exec can
 provide a stable absolute local path without forwarding image content.
 
-The parent may link a stable original source as an ordinary file link. The Codex
-UI may fetch or proxy that source for preview; that UI-side transfer is outside
-this boundary.
+The parent may present a stable original source as a Markdown image in
+commentary or final messages. The Codex UI may fetch or proxy that source for
+preview; that UI-side transfer is outside this boundary.
 
 The launcher and worker use the current OS account, environment, Codex
 authentication, and filesystem access allowed by the worker sandbox. Images use
@@ -48,11 +48,13 @@ temporary directory. Job files are `0600` inside a `0700` directory and contain
 no source paths, labels, prompts, raw events, stderr, image data, or report
 drafts.
 
-The command runner's managed foreground session is the normal result path. If
-that handle is lost, `status --job-id ID` returns coarse persisted progress,
-`collect --job-id ID` returns a terminal validated envelope, and
-`cleanup --job-id ID` removes a terminal record. Status is a progress snapshot,
-not a liveness probe or ETA.
+The command runner's managed foreground session is the normal execution path.
+Its stdout is redirected away from the parent command card; after it exits,
+`collect --job-id ID` returns the terminal validated envelope once and
+`cleanup --job-id ID` removes the terminal record. If the foreground handle is
+lost, `status --job-id ID` provides coarse persisted progress until the same
+envelope can be collected. Status is a progress snapshot, not a liveness probe
+or ETA.
 
 ## Worker model
 
