@@ -16,9 +16,12 @@
 [openai/codex#28316](https://github.com/openai/codex/issues/28316)、
 [#24550](https://github.com/openai/codex/issues/24550)、
 [#24388](https://github.com/openai/codex/issues/24388) 和
-[#33024](https://github.com/openai/codex/issues/33024) 所涉及的 Codex 历史与上下文
-问题。它只能保护在像素进入父任务前就通过本 Skill 路由的本地图片，不能清理已经
-膨胀的任务，也不是上游问题的正式修复。
+[#33024](https://github.com/openai/codex/issues/33024) 所记录的图像历史与大上下文
+故障。本机使用 Codex CLI `0.150.1` 仍可复现 WebSocket 连接问题，图片进入父任务
+上下文是触发该问题的显著因素。此次 CLI 更新前，图片内容会在上下文压缩后被清理。
+
+本 Skill 只能保护在像素进入父任务前就通过它路由的本地图片，不能清理已经膨胀的
+任务，也不是上游问题的正式修复。
 
 本机测试中，简单 worker 调用约 14 秒，父任务到 worker 的隐式流程约 31 秒，
 自动准备细节的三图任务约 69–84 秒；一次 90 图历史回放保留了主要结论，同时

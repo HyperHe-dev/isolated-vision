@@ -4,8 +4,8 @@ English | [简体中文](README.zh-CN.md)
 
 An experimental Codex Skill that routes local-image viewing through an
 ephemeral `codex exec` worker and returns a validated text report. The parent
-task continues from paths, task context, and visual observations rather than
-image-bearing worker output.
+task continues from paths, task context, and visual observations. Image-bearing
+worker output stays inside the isolated path.
 
 > [!IMPORTANT]
 > This is a temporary, model-routed workaround. It is not an OS sandbox, a
@@ -14,13 +14,19 @@ image-bearing worker output.
 
 ## Why
 
-This project mitigates Codex history/context problems reported in
+This project is motivated by related Codex image-history and large-context
+failure modes reported in
 [openai/codex#28316](https://github.com/openai/codex/issues/28316),
 [#24550](https://github.com/openai/codex/issues/24550),
 [#24388](https://github.com/openai/codex/issues/24388), and
-[#33024](https://github.com/openai/codex/issues/33024). It only protects local
-images routed through the Skill before their pixels reach the parent; it cannot
-repair an already bloated task or fix the upstream behavior.
+[#33024](https://github.com/openai/codex/issues/33024). Local testing with Codex
+CLI `0.150.1` still reproduces the WebSocket connection issue. Images entering
+the parent context are a significant trigger. Before the CLI update, compaction
+cleared image content from the context.
+
+The Skill only protects local images routed through it before their pixels reach
+the parent; it cannot repair an already bloated task or fix the upstream
+behavior.
 
 Local tests took about 14 seconds for a simple worker call, 31 seconds for an
 implicit parent-to-worker flow, and 69–84 seconds for a three-image run with
