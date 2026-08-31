@@ -16,13 +16,12 @@ through the Skill before any image-bearing tool call:
 - only a validated JSON report and fixed diagnostics reach the parent;
 - Data URLs, base64-like data, image signatures and keys, Markdown images, HTML
   image tags, malformed reports, and incomplete coverage fail closed;
-- handled timeouts and interrupts terminate the worker process group and remove
-  the private image workspace;
-- optional job records contain only coarse status and the validated result. Files
-  are `0600` inside a `0700` text-only directory on POSIX systems. On Windows,
-  job and private-workspace directories have a protected DACL for the current
-  account, SYSTEM, and local Administrators, which child files inherit;
-- on Windows, the worker is assigned to a kill-on-close Job Object so an abrupt
+- handled timeouts and interrupts terminate the Windows worker process tree and
+  remove the private image workspace;
+- optional job records contain only coarse status and the validated result. Job
+  and private-workspace directories have a protected Windows DACL for the
+  current account, SYSTEM, and local Administrators, which child files inherit;
+- the worker is assigned to a kill-on-close Windows Job Object so an abrupt
   launcher exit terminates its process tree.
 
 A report recovered after timeout must pass the same safety, schema, and coverage
@@ -44,9 +43,9 @@ checks as an ordinary result.
   so keep it current and sandbox hostile inputs separately.
 - Text reports can be incomplete or wrong. Recoverable job records persist until
   cleanup and may contain sensitive conclusions.
-- `SIGKILL`, Windows `TerminateProcess`, host crashes, or power loss may leave
-  temporary workspaces or job records behind. An abrupt Windows exit still
-  terminates the assigned worker tree, but cannot run Python directory cleanup.
+- `TerminateProcess`, host crashes, or power loss may leave temporary workspaces
+  or job records behind. An abrupt Windows exit still terminates the assigned
+  worker tree, but cannot run Python directory cleanup.
 
 Do not use this project as the sole control for secrets, regulated data, hostile
 files, or environments where the child must not read other local data.

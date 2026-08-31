@@ -43,10 +43,9 @@ source once, unchanged. It applies to the whole request.
 
 ## Job control
 
-A fresh opaque `--job-id` creates a text-only record in the operating system's
-temporary directory. On POSIX systems, job files are `0600` inside a `0700`
-directory. On Windows, the job and private-workspace directories use a protected
-DACL that grants full access only to the current account, SYSTEM, and the local
+A fresh opaque `--job-id` creates a text-only record in the Windows temporary
+directory. The job and private-workspace directories use a protected DACL that
+grants full access only to the current account, SYSTEM, and the local
 Administrators group; child files inherit that DACL. Records contain no source
 paths, labels, prompts, raw events, stderr, image data, or report drafts.
 
@@ -87,12 +86,12 @@ optional fixed validation-rule ID.
 Workspace or job-state errors, blocked worker launch, timeout, nonzero exit,
 missing output, invalid JSON, schema failure, incomplete coverage, and
 image-like output return a fixed safe error envelope. Handled interrupts and
-ordinary timeouts terminate the worker process group or Windows process tree and
-remove the private image workspace. On Windows, a kill-on-close Job Object also
-terminates the worker tree if the launcher is forcibly ended.
+ordinary timeouts terminate the Windows worker process tree and remove the
+private image workspace. A kill-on-close Job Object also terminates the worker
+tree if the launcher is forcibly ended.
 
 A fully written final report may be recovered after timeout when it passes the
-same safety, schema, and coverage checks as an ordinary result. `SIGKILL`,
-Windows `TerminateProcess`, host failure, or power loss may leave temporary
-workspaces or job records behind; a record left in the `running` state by such a
-failure is removed manually, since `cleanup` only removes terminal records.
+same safety, schema, and coverage checks as an ordinary result.
+`TerminateProcess`, host failure, or power loss may leave temporary workspaces
+or job records behind; a record left in the `running` state by such a failure is
+removed manually, since `cleanup` only removes terminal records.

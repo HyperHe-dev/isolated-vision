@@ -37,9 +37,9 @@ schema 校验的文字报告和固定诊断信息。可选 job ID 支持粗粒�
 
 ## 安装
 
-需要 Windows、macOS 或 Linux、Python 3.10+、Pillow，以及能从 `PATH` 找到且
-已完成身份验证的 `codex` CLI。嵌套进程必须能够连接 Codex 服务。Windows 可直接
-原生运行，不要求 WSL。
+本 `windows-support` 分支的正式支持范围仅限原生 Windows，不要求 WSL。需要
+Python 3.10+、Pillow，以及能从 `PATH` 找到且已完成身份验证的 `codex` CLI。
+嵌套进程必须能够连接 Codex 服务。
 
 让 Codex 从本仓库安装 Skill 目录：
 
@@ -47,27 +47,14 @@ schema 校验的文字报告和固定诊断信息。可选 job ID 支持粗粒�
 使用 $skill-installer 安装这个仓库中的 isolated-vision 目录。
 ```
 
-然后把 Pillow 安装到 Codex 实际使用的同一个 Python 环境：
-
-```bash
-python -m pip install -r /仓库检出目录的绝对路径/isolated-vision/requirements.txt
-```
-
-如果 macOS 或 Linux 上的 Python 3.10+ 命令名是 `python3`，请相应替换。
-
-在 Windows PowerShell 中可直接使用 Windows 路径：
+然后把 Pillow 安装到 Codex 实际使用的同一个 Python 环境。Windows PowerShell
+可直接使用 Windows 路径：
 
 ```powershell
 python -m pip install -r C:\仓库检出目录\isolated-vision\requirements.txt
 ```
 
 ## 使用
-
-```text
-使用 $isolated-vision 查看 /图片的绝对路径/screenshot.png，并返回当前任务需要的视觉信息。
-```
-
-Windows 路径也可直接使用：
 
 ```text
 使用 $isolated-vision 查看 C:\图片目录\screenshot.png，并返回当前任务需要的视觉信息。
@@ -107,21 +94,21 @@ Skill 路由属于模型行为，不是强制工具拦截器。若要在项目�
   Job Object，超时清理会使用 Windows 原生机制终止整个进程树。
 - 如果无法从 `PATH` 找到 `codex`，可将 `ISOLATED_VISION_CODEX` 设置为
   `codex.exe` 或 `codex.cmd` 的绝对路径。
-- PowerShell 使用 `$null`，对应 POSIX shell 示例中的 `/dev/null`。
+- 私有 worker 运行期间，PowerShell 将启动器 stdout 重定向到 `$null`。
 - `Ctrl+C`/`Ctrl+Break` 可走正常清理流程。突发的 `TerminateProcess`、主机崩溃或
   断电仍可能留下私有工作区，或让任务记录停在 `running`；Windows Job Object 仍会
   终止 worker 进程树。确认没有任务仍在运行后，需要手动删除这些陈旧状态。
 
 ## 开发与测试
 
-```bash
+```powershell
 python -m pip install -r isolated-vision/requirements.txt
 python -m unittest discover -s tests -p 'test_*.py' -v
 python -m py_compile isolated-vision/scripts/vision.py
 ```
 
-单元测试使用假的 Codex 可执行文件，不会上传 fixture；GitHub Actions 会在 Ubuntu
-和 Windows 上测试 Python 3.10 与 3.13，但不会运行真实视觉 worker。
+单元测试使用假的 Codex 可执行文件，不会上传 fixture；GitHub Actions 会在 Windows
+上测试 Python 3.10 与 3.13，但不会运行真实视觉 worker。
 
 ## 许可证
 
